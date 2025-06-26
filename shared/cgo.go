@@ -8,5 +8,5 @@ package shared
 // #cgo CFLAGS: -Werror=implicit-function-declaration
 // #cgo CFLAGS: -Werror=return-type -Wendif-labels -Werror=overflow
 // #cgo CFLAGS: -Wnested-externs -fexceptions
-// #cgo LDFLAGS: -lutil -lpthread
+// #cgo LDFLAGS: -lc
 import "C"
