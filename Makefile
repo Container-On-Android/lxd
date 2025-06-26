@@ -104,7 +104,7 @@ dqlite:
 	# dqlite (+raft)
 	@if [ ! -e "$(DQLITE_PATH)" ]; then \
 		echo "Retrieving dqlite from ${DQLITE_BRANCH} branch"; \
-		git clone --depth=1 --branch "${DQLITE_BRANCH}" "https://github.com/canonical/dqlite" "$(DQLITE_PATH)"; \
+		git clone --depth=1 --branch "${DQLITE_BRANCH}" "https://github.com/DreamConnected/libdqlite-dev" "$(DQLITE_PATH)"; \
 	elif [ -e "$(DQLITE_PATH)/.git" ]; then \
 		echo "Updating existing dqlite branch"; \
 		git -C "$(DQLITE_PATH)" pull; \
@@ -112,7 +112,7 @@ dqlite:
 
 	cd "$(DQLITE_PATH)" && \
 		autoreconf -i && \
-		./configure --enable-build-raft && \
+		./configure --host ${TARGET} --enable-build-raft && \
 		make
 
 .PHONY: liblxc
