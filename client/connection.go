@@ -194,7 +194,7 @@ func ConnectLXDUnixWithContext(ctx context.Context, path string, args *Connectio
 			} else {
 				path = "/var/snap/lxd/common/lxd/unix.socket"
 				if !shared.PathIsWritable(path) {
-					path = "/var/lib/lxd/unix.socket"
+					path = "/data/share/var/lib/lxd/unix.socket"
 				}
 			}
 		}

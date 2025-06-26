@@ -1,4 +1,4 @@
-//go:build !armhf && !arm && !arm32
+//go:build !armhf && !arm && !arm32 && !android
 
 package cdi
 

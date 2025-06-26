@@ -782,7 +782,7 @@ func (d *lxc) initLXC(config bool) (*liblxc.Container, error) {
 	// For lxcfs
 	templateConfDir := os.Getenv("LXD_LXC_TEMPLATE_CONFIG")
 	if templateConfDir == "" {
-		templateConfDir = "/usr/share/lxc/config"
+		templateConfDir = "/data/share/usr/share/lxc/config"
 	}
 
 	if shared.PathExists(templateConfDir + "/common.conf.d/") {
@@ -1043,7 +1043,7 @@ func (d *lxc) initLXC(config bool) (*liblxc.Container, error) {
 	if shared.IsTrue(d.expandedConfig["nvidia.runtime"]) {
 		hookDir := os.Getenv("LXD_LXC_HOOK")
 		if hookDir == "" {
-			hookDir = "/usr/share/lxc/hooks"
+			hookDir = "/data/share/usr/share/lxc/hooks"
 		}
 
 		hookPath := filepath.Join(hookDir, "nvidia")

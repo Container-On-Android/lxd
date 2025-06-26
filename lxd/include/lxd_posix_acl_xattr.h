@@ -24,7 +24,11 @@
 #define POSIX_ACL_XATTR_VERSION	0x0002
 
 /* An undefined entry e_id value */
+#ifdef __ANDROID__
+// Android NDK is defined ACL_UNDEFINED_ID as (- 1), no need to define it again.
+#else
 #define ACL_UNDEFINED_ID	(-1)
+#endif
 
 struct posix_acl_xattr_entry {
 	__le16			e_tag;

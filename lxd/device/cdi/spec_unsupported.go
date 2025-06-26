@@ -1,4 +1,4 @@
-//go:build armhf || arm || arm32
+//go:build armhf || arm || arm32 || android
 
 package cdi
 
@@ -11,6 +11,7 @@ import (
 	"github.com/canonical/lxd/lxd/state"
 )
 
+// Android should not be able to play with Intel and NVIDIA.
 func defaultNvidiaTegraCSVFiles(rootPath string) []string {
 	return []string{}
 }
