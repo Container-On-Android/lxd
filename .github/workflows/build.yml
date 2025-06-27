@@ -68,7 +68,7 @@ jobs:
 
         liblxc=$(curl -s https://api.github.com/repos/Container-On-Android/lxc/releases/latest | grep browser_download_url | cut -d'"' -f4 |grep -E 'lxc.tar.gz$')
         liblxc_file=$(curl -s https://api.github.com/repos/Container-On-Android/lxc/releases/latest | grep name | cut -d'"' -f4 |grep -E 'lxc.tar.gz$')
-        wget -q ${libapparmor} && sudo mkdir -p /data/share && sudo tar -zxf ${liblxc_file} -C /data/share/ && echo 6/6 ${liblxc} ${liblxc_file}
+        wget -q ${liblxc} && sudo mkdir -p /data/share && sudo tar -zxf ${liblxc_file} -C /data/share/ && echo 6/6 ${liblxc} ${liblxc_file}
 
     - name: Set build parameters
       id: vars
