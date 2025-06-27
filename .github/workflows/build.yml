@@ -42,7 +42,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get install -y -qq build-essential pipx python3-venv pkg-config cmake \
-        python3-pip
+        python3-pip jimsh
 
     - name: Download libs 
       run: |
@@ -69,6 +69,13 @@ jobs:
         liblxc=$(curl -s https://api.github.com/repos/Container-On-Android/lxc/releases/latest | grep browser_download_url | cut -d'"' -f4 |grep -E 'lxc.tar.gz$')
         liblxc_file=$(curl -s https://api.github.com/repos/Container-On-Android/lxc/releases/latest | grep name | cut -d'"' -f4 |grep -E 'lxc.tar.gz$')
         wget -q ${liblxc} && sudo mkdir -p /data/share && sudo tar -zxf ${liblxc_file} -C /data/share/ && echo 6/6 ${liblxc} ${liblxc_file}
+
+        libuv=$(curl -s https://api.github.com/repos/DreamConnected/libuv-dev/releases/latest | grep browser_download_url | cut -d'"' -f4 |grep -E 'zip$')
+        libuv_file=$(curl -s https://api.github.com/repos/DreamConnected/libuv-dev/releases/latest | grep name | cut -d'"' -f4 |grep -E 'zip$')
+        wget -q ${libuv} && sudo unzip -q -o ${libuv_file} -d / && echo 5/6 ${libuv} ${libuv_file}
+
+        #libintl
+        #libacl
 
     - name: Set build parameters
       id: vars
