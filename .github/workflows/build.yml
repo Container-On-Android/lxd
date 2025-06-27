@@ -1,0 +1,108 @@
+# This workflow will build a golang project
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
+
+name: Build lxd aarch64 android
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_arch:
+        description: 'Target architecture (aarch64/arm/x86_64/i686)'
+        required: false
+        default: 'aarch64'
+      ndk_version:
+        description: 'Android NDK version'
+        required: false
+        default: 'r27c'
+      go_version:
+        description: 'Golang version'
+        required: false
+        default: '1.24.2'        
+      android_api:
+        description: 'Android API level'
+        required: false
+        default: '30'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Android NDK
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: ${{ github.event.inputs.ndk_version || 'r27c' }}
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ github.event.inputs.go_version || '1.24.2' }}
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get install -y -qq build-essential pipx python3-venv pkg-config cmake \
+        python3-pip
+
+    - name: Download libs 
+      run: |
+        libssl=$(curl -s https://api.github.com/repos/DreamConnected/libopenssl-dev/releases/latest | grep browser_download_url | cut -d'"' -f4 |grep -E 'zip$')
+        libssl_file=$(curl -s https://api.github.com/repos/DreamConnected/libopenssl-dev/releases/latest | grep name | cut -d'"' -f4 |grep -E 'zip$')
+        wget -q ${libssl} && sudo unzip -q -o ${libssl_file} -d / && echo 1/6 ${libssl} ${libssl_file}
+        
+        libcap=$(curl -s https://api.github.com/repos/DreamConnected/AndroidLibcapBuild/releases/latest | grep browser_download_url | cut -d'"' -f4 |grep -E 'zip$')
+        libcap_file=$(curl -s https://api.github.com/repos/DreamConnected/AndroidLibcapBuild/releases/latest | grep name | cut -d'"' -f4 |grep -E 'zip$')
+        wget -q ${libcap} && sudo unzip -q -o ${libcap_file} -d / && echo 2/6 ${libcap} ${libcap_file}
+
+        libapparmor=$(curl -s https://api.github.com/repos/DreamConnected/libapparmor-dev/releases/latest | grep browser_download_url | cut -d'"' -f4 |grep -E 'zip$')
+        libapparmor_file=$(curl -s https://api.github.com/repos/DreamConnected/libapparmor-dev/releases/latest | grep name | cut -d'"' -f4 |grep -E 'zip$')
+        wget -q ${libapparmor} && sudo unzip -q -o ${libapparmor_file} -d / && echo 3/6 ${libapparmor} ${libapparmor_file}
+
+        libselinux=$(curl -s https://api.github.com/repos/DreamConnected/libselinux-dev/releases/latest | grep browser_download_url | cut -d'"' -f4 |grep -E 'zip$')
+        libselinux_file=$(curl -s https://api.github.com/repos/DreamConnected/libselinux-dev/releases/latest | grep name | cut -d'"' -f4 |grep -E 'zip$')
+        wget -q ${libselinux} && sudo unzip -q -o ${libselinux_file} -d / && echo 4/6 ${libselinux} ${libselinux_file}
+
+        libseccomp=$(curl -s https://api.github.com/repos/DreamConnected/libseccomp-dev/releases/latest | grep browser_download_url | cut -d'"' -f4 |grep -E 'zip$')
+        libseccomp_file=$(curl -s https://api.github.com/repos/DreamConnected/libseccomp-dev/releases/latest | grep name | cut -d'"' -f4 |grep -E 'zip$')
+        wget -q ${libseccomp} && sudo unzip -q -o ${libseccomp_file} -d / && echo 5/6 ${libseccomp} ${libseccomp_file}
+
+        liblxc=$(curl -s https://api.github.com/repos/Container-On-Android/lxc/releases/latest | grep browser_download_url | cut -d'"' -f4 |grep -E 'lxc.tar.gz$')
+        liblxc_file=$(curl -s https://api.github.com/repos/Container-On-Android/lxc/releases/latest | grep name | cut -d'"' -f4 |grep -E 'lxc.tar.gz$')
+        wget -q ${libapparmor} && sudo mkdir -p /data/share && sudo tar -zxf ${liblxc_file} -C /data/share/ && echo 6/6 ${liblxc} ${liblxc_file}
+
+    - name: Set build parameters
+      id: vars
+      run: |
+        # Set target triple based on architecture
+        case "${{ github.event.inputs.target_arch || 'aarch64' }}" in
+          aarch64) target="aarch64-linux-android" ;;
+          arm) target="armv7a-linux-androideabi" ;;
+          x86_64) target="x86_64-linux-android" ;;
+          i686) target="i686-linux-android" ;;
+          *) echo "Unsupported architecture"; exit 1 ;;
+        esac
+        
+        echo "target=$target" >> $GITHUB_OUTPUT
+        echo "api=${{ github.event.inputs.android_api || '30' }}" >> $GITHUB_OUTPUT
+
+    - name: Build
+      run: | 
+        export NDK_TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+        export TARGET=${{ steps.vars.outputs.target }}
+        export API=${{ steps.vars.outputs.api }}
+        export AR=$NDK_TOOLCHAIN/llvm-ar
+        export CC="$NDK_TOOLCHAIN/clang --target=$TARGET$API"
+        export AS=$CC
+        export CXX="$NDK_TOOLCHAIN/clang++ --target=$TARGET$API"
+        export LD=$NDK_TOOLCHAIN/ld
+        export RANLIB=$NDK_TOOLCHAIN/llvm-ranlib
+        export STRIP=$NDK_TOOLCHAIN/llvm-strip
+
+        export GOOS=android
+        export GOARCH=arm64
+        export CGO_ENABLED=1
+        export PKG_CONFIG_PATH=/data/sysroot/lib/pkgconfig:/data/sysroot/lib64/pkgconfig:/data/share/lib/pkgconfig:$PKG_CONFIG_PATH
+
+        make deps
+        make
+
