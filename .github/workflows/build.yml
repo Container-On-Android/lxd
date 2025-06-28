@@ -41,8 +41,9 @@ jobs:
 
     - name: Install dependencies
       run: |
-        sudo apt-get install -y -qq build-essential pipx python3-venv pkg-config cmake \
+        sudo apt-get install -y -qq build-essential zlib1g-dev pipx python3-venv pkg-config cmake \
         python3-pip jimsh
+        sudo apt remove --purge liblz4-dev
 
     - name: Download libs 
       run: |
