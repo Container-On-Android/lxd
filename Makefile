@@ -154,10 +154,10 @@ liblxc:
 	#	meson compile -C build && \
 	#	ninja -C build install
 
-ifneq ($(shell command -v ldd),)
+ifneq ($(shell command -v nm),)
 	# verify that liblxc.so is linked against some critically important libs
-	ldd "$(LIBLXC_PATH)/lib/liblxc.so" | grep -wE 'libapparmor|libcap|libseccomp'
-	[ "$$(ldd "$(LIBLXC_PATH)/lib/liblxc.so" | grep -cwE 'libapparmor|libcap|libseccomp')" = "3" ]
+	nm -D "$(LIBLXC_PATH)/lib/liblxc.so" | grep -wE 'lxc_log_category_apparmor|lxc_log_category_caps|lxc_log_category_seccomp'
+	[ "$$(nm -D "$(LIBLXC_PATH)/lib/liblxc.so" | grep -cwE 'lxc_log_category_apparmor|lxc_log_category_caps|lxc_log_category_seccomp')" = "3" ]
 	@echo "OK: liblxc .so link check passed"
 endif
 
