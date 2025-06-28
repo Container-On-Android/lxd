@@ -25,13 +25,14 @@ else
 	DEPS_PATH=$(GOPATH)/deps
 endif
 DQLITE_PATH=$(DEPS_PATH)/dqlite
-LIBLXC_PATH=$(DEPS_PATH)/liblxc
-LIBLXC_ROOTFS_MOUNT_PATH=$(GOPATH)/bin/liblxc/rootfs
+SYSROOT_PATH=/data/sysroot
+LIBLXC_PATH=/data/share
+LIBLXC_ROOTFS_MOUNT_PATH=$(LIBLXC_PATH)/lib/lxc/rootfs
 
-export CGO_CFLAGS ?= -I$(DQLITE_PATH)/include/ -I$(LIBLXC_PATH)/include/
-export CGO_LDFLAGS ?= -L$(DQLITE_PATH)/.libs/ -L$(LIBLXC_PATH)/lib/$(ARCH)-linux-gnu/
-export LD_LIBRARY_PATH ?= $(DQLITE_PATH)/.libs/:$(LIBLXC_PATH)/lib/$(ARCH)-linux-gnu/
-export PKG_CONFIG_PATH ?= $(LIBLXC_PATH)/lib/$(ARCH)-linux-gnu/pkgconfig
+export CGO_CFLAGS ?= -I$(DQLITE_PATH)/include/ -I$(LIBLXC_PATH)/include/ -I$(SYSROOT_PATH)/include/ -I$(SYSROOT_PATH)/usr/include
+export CGO_LDFLAGS ?= -L$(DQLITE_PATH)/.libs/ -L$(LIBLXC_PATH)/lib/ -L$(SYSROOT_PATH)/lib/ -L$(SYSROOT_PATH)/lib64/ -lintl
+export LD_LIBRARY_PATH ?= $(DQLITE_PATH)/.libs/:$(LIBLXC_PATH)/lib/:$(SYSROOT_PATH)/lib/:$(SYSROOT_PATH)/lib64/
+export PKG_CONFIG_PATH ?= $(LIBLXC_PATH)/lib/pkgconfig:$(SYSROOT_PATH)/lib/pkgconfig:$(SYSROOT_PATH)/lib64/pkgconfig
 export CGO_LDFLAGS_ALLOW ?= (-Wl,-wrap,pthread_create)|(-Wl,-z,now)
 
 .PHONY: default
@@ -118,45 +119,45 @@ dqlite:
 .PHONY: liblxc
 liblxc:
 	# lxc/liblxc
-	@if [ ! -e "$(LIBLXC_PATH)" ]; then \
-		echo "Retrieving lxc/liblxc from $(LIBLXC_BRANCH) branch"; \
-		git clone --depth=1 --branch "${LIBLXC_BRANCH}" "https://github.com/lxc/lxc" "$(LIBLXC_PATH)"; \
-	elif [ -e "$(LIBLXC_PATH)/.git" ]; then \
-		echo "Updating existing lxc/liblxc branch"; \
-		git -C "$(LIBLXC_PATH)" pull; \
-	fi
+	#@if [ ! -e "$(LIBLXC_PATH)" ]; then \
+	#	echo "Retrieving lxc/liblxc from $(LIBLXC_BRANCH) branch"; \
+	#	git clone --depth=1 --branch "${LIBLXC_BRANCH}" "https://github.com/lxc/lxc" "$(LIBLXC_PATH)"; \
+	#elif [ -e "$(LIBLXC_PATH)/.git" ]; then \
+	#	echo "Updating existing lxc/liblxc branch"; \
+	#	git -C "$(LIBLXC_PATH)" pull; \
+	#fi
 
 	# XXX: the rootfs-mount-path must not depend on LIBLXC_PATH to allow
 	# building in "vendor" mode but move the resulting binaries elsewhere for
 	# caching purposes
-	cd "$(LIBLXC_PATH)" && \
-		meson setup \
-			--buildtype=release \
-			-Dapparmor=true \
-			-Dcapabilities=true \
-			-Dcommands=false \
-			-Ddbus=false \
-			-Dexamples=false \
-			-Dinstall-init-files=false \
-			-Dinstall-state-dirs=false \
-			-Dman=false \
-			-Dmemfd-rexec=false \
-			-Dopenssl=false \
-			-Dprefix="$(LIBLXC_PATH)" \
-			-Drootfs-mount-path="$(LIBLXC_ROOTFS_MOUNT_PATH)" \
-			-Dseccomp=true \
-			-Dselinux=false \
-			-Dspecfile=false \
-			-Dtests=false \
-			-Dtools=false \
-			build && \
-		meson compile -C build && \
-		ninja -C build install
+	#cd "$(LIBLXC_PATH)" && \
+	#	meson setup \
+	#		--buildtype=release \
+	#		-Dapparmor=true \
+	#		-Dcapabilities=true \
+	#		-Dcommands=false \
+	#		-Ddbus=false \
+	#		-Dexamples=false \
+	#		-Dinstall-init-files=false \
+	#		-Dinstall-state-dirs=false \
+	#		-Dman=false \
+	#		-Dmemfd-rexec=false \
+	#		-Dopenssl=false \
+	#		-Dprefix="$(LIBLXC_PATH)" \
+	#		-Drootfs-mount-path="$(LIBLXC_ROOTFS_MOUNT_PATH)" \
+	#		-Dseccomp=true \
+	#		-Dselinux=false \
+	#		-Dspecfile=false \
+	#		-Dtests=false \
+	#		-Dtools=false \
+	#		build && \
+	#	meson compile -C build && \
+	#	ninja -C build install
 
 ifneq ($(shell command -v ldd),)
 	# verify that liblxc.so is linked against some critically important libs
-	ldd "$(LIBLXC_PATH)/lib/$(ARCH)-linux-gnu/liblxc.so" | grep -wE 'libapparmor|libcap|libseccomp'
-	[ "$$(ldd "$(LIBLXC_PATH)/lib/$(ARCH)-linux-gnu/liblxc.so" | grep -cwE 'libapparmor|libcap|libseccomp')" = "3" ]
+	ldd "$(LIBLXC_PATH)/lib/liblxc.so" | grep -wE 'libapparmor|libcap|libseccomp'
+	[ "$$(ldd "$(LIBLXC_PATH)/lib/liblxc.so" | grep -cwE 'libapparmor|libcap|libseccomp')" = "3" ]
 	@echo "OK: liblxc .so link check passed"
 endif
 
