@@ -126,7 +126,7 @@ jobs:
         export PKG_CONFIG_PATH=/data/sysroot/lib/pkgconfig:/data/sysroot/lib64/pkgconfig:/data/share/lib/pkgconfig:$PKG_CONFIG_PATH
 
         make deps
-        export CGO_CFLAGS="-I/home/runner/go/deps/dqlite/include/ -I/data/share/include/ -I/data/sysroot/include/ -I/data/sysroot/usr/include"
+        export CGO_CFLAGS="-I/home/runner/go/deps/dqlite/include/ -I/data/share/include/ -I/data/sysroot/include/ -I/data/sysroot/usr/include -Wno-sizeof-pointer-memaccess"
         export CGO_LDFLAGS="-L/home/runner/go/deps/dqlite/.libs/ -L/data/share/lib/ -L/data/sysroot/lib/ -L/data/sysroot/lib64/ -lintl"
         export LD_LIBRARY_PATH="/home/runner/go/deps/dqlite/.libs/:/data/share/lib/:/data/sysroot/lib/:/data/sysroot/lib64/"
         export CGO_LDFLAGS_ALLOW="(-Wl,-wrap,pthread_create)|(-Wl,-z,now)"
