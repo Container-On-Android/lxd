@@ -43,7 +43,11 @@ jobs:
       run: |
         sudo apt-get install -y -qq build-essential zlib1g-dev pipx python3-venv pkg-config cmake \
         python3-pip jimsh
+        sudo npm install -g conventional-changelog-cli
         sudo apt remove --purge liblz4-dev
+        
+    - name: Generate CHANGELOG
+      run: conventional-changelog -p angular -i CHANGELOG.md -s
 
     - name: Download libs 
       run: |
@@ -131,4 +135,33 @@ jobs:
         export LD_LIBRARY_PATH="/home/runner/go/deps/dqlite/.libs/:/data/share/lib/:/data/sysroot/lib/:/data/sysroot/lib64/"
         export CGO_LDFLAGS_ALLOW="(-Wl,-wrap,pthread_create)|(-Wl,-z,now)"
         make
+        echo "RELEASE_TAG=$(meson introspect meson.build --projectinfo | jq -r '.version')-$(git log -1 --format=%h)" >> $GITHUB_ENV
 
+    - name: Upload artifacts sysroot
+      uses: actions/upload-artifact@v4.3.1
+      with:
+        name: android-${{ github.event.inputs.target_arch || 'aarch64' }}-deps
+        path: /data/*
+
+    - name: Upload artifacts lxd
+      uses: actions/upload-artifact@v4.3.1
+      with:
+        name: android-${{ github.event.inputs.target_arch || 'aarch64' }}-lxd
+        path: /home/runner/go/bin/android_arm64/*
+
+    - name: Create a TAR file for artifact
+      run: |
+        tar -czvf android-${{ github.event.inputs.target_arch || 'aarch64' }}-api30-lxd.tar.gz -C /home/runner/go/bin/android_arm64 .
+        tar -czvf android-${{ github.event.inputs.target_arch || 'aarch64' }}-api30-sysroot.tar.gz -C /data .
+    
+    - name: Create Release and Upload Release Asset
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ env.RELEASE_TAG }}
+        name: Release ${{ env.RELEASE_TAG }}
+        body_path: CHANGELOG.md
+        draft: false
+        prerelease: false
+        files: |
+            android-${{ github.event.inputs.target_arch || 'aarch64' }}-api30-lxd.tar.gz
+            android-${{ github.event.inputs.target_arch || 'aarch64' }}-api30-sysroot.tar.gz
