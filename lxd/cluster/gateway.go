@@ -736,7 +736,7 @@ func (g *Gateway) NetworkUpdateCert(cert *shared.CertInfo) {
 // @bootstrap should only be true when turning a non-clustered LXD instance into
 // the first (and leader) node of a new LXD cluster.
 func (g *Gateway) init(bootstrap bool) error {
-	logger.Debugf("Initializing database gateway")
+	logger.Debug("Initializing database gateway")
 	g.stopCh = make(chan struct{})
 
 	info, err := loadInfo(g.db)
@@ -745,6 +745,9 @@ func (g *Gateway) init(bootstrap bool) error {
 	}
 
 	dir := g.db.DqliteDir()
+	if shared.PathExists(filepath.Join(dir, "logs.db")) {
+		return errors.New("Unsupported upgrade path, please first upgrade to LXD 4.0")
+	}
 
 	// If the resulting raft instance is not nil, it means that this node
 	// should serve as database node, so create a dqlite driver possibly
@@ -1065,13 +1068,11 @@ func dqliteNetworkDial(ctx context.Context, name string, addr string, g *Gateway
 	setDqliteVersionHeader(request)
 	request = request.WithContext(ctx)
 
-	deadline, _ := ctx.Deadline()
-	dialer := &net.Dialer{Timeout: time.Until(deadline)}
-
 	revert := revert.New()
 	defer revert.Fail()
 
-	conn, err := tls.DialWithDialer(dialer, "tcp", addr, config)
+	dialer := &tls.Dialer{Config: config}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("Failed connecting to HTTP endpoint %q: %w", addr, err)
 	}
@@ -1226,7 +1227,10 @@ func dqliteProxy(name string, stopCh chan struct{}, remote net.Conn, local net.C
 			errs[0] = fmt.Errorf("local -> remote: %w", err)
 		}
 
-		_ = remoteTCP.CloseRead()
+		if remoteTCP != nil {
+			_ = remoteTCP.CloseRead()
+		}
+
 		err = <-remoteToLocal
 		if err != nil {
 			errs[1] = fmt.Errorf("remote -> local: %w", err)

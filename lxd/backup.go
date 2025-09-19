@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/canonical/lxd/lxd/backup"
 	backupConfig "github.com/canonical/lxd/lxd/backup/config"
@@ -104,7 +104,7 @@ func backupCreate(s *state.State, args db.InstanceBackup, sourceInst instance.In
 	}
 
 	// Create the target path if needed.
-	backupsPathBase := s.BackupsStoragePath()
+	backupsPathBase := s.BackupsStoragePath(sourceInst.Project().Name)
 
 	backupsPath := filepath.Join(backupsPathBase, "instances", project.Instance(sourceInst.Project().Name, sourceInst.Name()))
 	if !shared.PathExists(backupsPath) {
@@ -255,7 +255,8 @@ func backupWriteIndex(sourceInst instance.Instance, pool storagePools.Pool, opti
 		return os.ErrNotExist
 	}
 
-	config, err := pool.GenerateInstanceBackupConfig(sourceInst, snapshots, nil)
+	// Do not include any custom storage volumes (and their pools) in the backup config.
+	config, err := pool.GenerateInstanceBackupConfig(sourceInst, snapshots, nil, nil)
 	if err != nil {
 		return fmt.Errorf("Failed generating instance backup config: %w", err)
 	}
@@ -448,7 +449,7 @@ func volumeBackupCreate(s *state.State, args db.StoragePoolVolumeBackup, project
 	}
 
 	// Create the target path if needed.
-	backupsPathBase := s.BackupsStoragePath()
+	backupsPathBase := s.BackupsStoragePath(projectName)
 
 	backupsPath := filepath.Join(backupsPathBase, "custom", pool.Name(), project.StorageVolume(projectName, volumeName))
 	if !shared.PathExists(backupsPath) {
@@ -553,7 +554,7 @@ func volumeBackupWriteIndex(projectName string, volumeName string, pool storageP
 
 	config, err := pool.GenerateCustomVolumeBackupConfig(projectName, volumeName, snapshots, nil)
 	if err != nil {
-		return fmt.Errorf("Failed generating volume backup config: %w", err)
+		return fmt.Errorf("Failed generating backup config of volume %q in pool %q and project %q: %w", volumeName, pool.Name(), projectName, err)
 	}
 
 	customVol, err := config.CustomVolume()

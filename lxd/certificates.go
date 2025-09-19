@@ -183,7 +183,7 @@ func certificatesGet(d *Daemon, r *http.Request) response.Response {
 		}
 
 		if len(withEntitlements) > 0 {
-			err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeCertificate, withEntitlements, urlToCertificate)
+			err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeCertificate, withEntitlements, urlToCertificate)
 			if err != nil {
 				return response.SmartError(err)
 			}
@@ -514,14 +514,14 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 		userCanCreateCertificates = true
 	}
 
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo == nil {
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
 		return response.SmartError(errors.New("Failed to get authentication status: Missing request context info"))
 	}
 
 	// If caller is already trusted and the trust token is provided, we validate the token and cancel
 	// the corresponding token operation.
-	if reqInfo.Trusted && req.TrustToken != "" {
+	if requestor.IsTrusted() && req.TrustToken != "" {
 		// Decode the trust token.
 		joinToken, err := shared.CertificateTokenDecode(req.TrustToken)
 		if err != nil {
@@ -542,7 +542,7 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// If caller is already trusted and does not have permission to create certificates, they cannot create more certificates.
-	if reqInfo.Trusted && !userCanCreateCertificates && req.Certificate == "" && !req.Token {
+	if requestor.IsTrusted() && !userCanCreateCertificates && req.Certificate == "" && !req.Token {
 		return response.BadRequest(errors.New("Client is already trusted"))
 	}
 
@@ -615,27 +615,9 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 			return response.BadRequest(fmt.Errorf("Invalid certificate material: %w", err))
 		}
 	} else if req.Token {
-		// Get all addresses the server is listening on. This is encoded in the certificate token,
-		// so that the client will not have to specify a server address. The client will iterate
-		// through all these addresses until it can connect to one of them.
-		addresses, err := util.ListenAddresses(localHTTPSAddress)
+		token, err := createCertificateAddToken(s, req.Name, "")
 		if err != nil {
-			return response.InternalError(err)
-		}
-
-		// Generate join secret for new client. This will be stored inside the join token operation and will be
-		// supplied by the joining client (encoded inside the join token) which will allow us to lookup the correct
-		// operation in order to validate the requested joining client name is correct and authorised.
-		joinSecret, err := shared.RandomCryptoString()
-		if err != nil {
-			return response.InternalError(err)
-		}
-
-		// Generate fingerprint of network certificate so joining member can automatically trust the correct
-		// certificate when it is presented during the join process.
-		fingerprint, err := shared.CertFingerprintStr(string(s.Endpoints.NetworkPublicKey()))
-		if err != nil {
-			return response.InternalError(err)
+			return response.SmartError(fmt.Errorf("Failed to create certificate add token: %w", err))
 		}
 
 		if req.Projects == nil {
@@ -643,9 +625,9 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 		}
 
 		meta := map[string]any{
-			"secret":      joinSecret,
-			"fingerprint": fingerprint,
-			"addresses":   addresses,
+			"secret":      token.Secret,
+			"fingerprint": token.Fingerprint,
+			"addresses":   token.Addresses,
 			"request":     req,
 		}
 
@@ -754,7 +736,7 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 	s.UpdateIdentityCache()
 
 	lc := lifecycle.CertificateCreated.Event(fingerprint, request.CreateRequestor(r.Context()), nil)
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+	s.Events.SendLifecycle("", lc)
 
 	return response.SyncResponseLocation(true, nil, lc.Source)
 }
@@ -825,7 +807,7 @@ func certificateGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	if len(withEntitlements) > 0 {
-		err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeCertificate, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.CertificateURL(cert.Fingerprint): cert})
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeCertificate, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.CertificateURL(cert.Fingerprint): cert})
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -1106,7 +1088,7 @@ func doCertificateUpdate(ctx context.Context, d *Daemon, dbInfo api.Certificate,
 	// Reload the identity cache.
 	s.UpdateIdentityCache()
 
-	s.Events.SendLifecycle(api.ProjectDefaultName, lifecycle.CertificateUpdated.Event(dbInfo.Fingerprint, request.CreateRequestor(r.Context()), nil))
+	s.Events.SendLifecycle("", lifecycle.CertificateUpdated.Event(dbInfo.Fingerprint, request.CreateRequestor(r.Context()), nil))
 
 	return response.EmptySyncResponse
 }
@@ -1222,7 +1204,7 @@ func certificateDelete(d *Daemon, r *http.Request) response.Response {
 	// Reload the cache.
 	s.UpdateIdentityCache()
 
-	s.Events.SendLifecycle(api.ProjectDefaultName, lifecycle.CertificateDeleted.Event(fingerprint, request.CreateRequestor(r.Context()), nil))
+	s.Events.SendLifecycle("", lifecycle.CertificateDeleted.Event(fingerprint, request.CreateRequestor(r.Context()), nil))
 
 	return response.EmptySyncResponse
 }

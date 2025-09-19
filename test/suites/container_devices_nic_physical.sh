@@ -1,6 +1,5 @@
 test_container_devices_nic_physical() {
   ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   ctName="nt$$"
   dummyMAC="aa:3b:97:97:0f:d5"
@@ -29,15 +28,13 @@ test_container_devices_nic_physical() {
   lxc start "${ctName}"
 
   # Check custom MTU is applied if feature available in LXD.
-  if lxc info | grep 'network_phys_macvlan_mtu: "true"' ; then
-    if ! lxc exec "${ctName}" -- grep "1400" /sys/class/net/eth0/mtu ; then
-      echo "mtu invalid"
-      false
-    fi
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/mtu)" != "1400" ]; then
+    echo "mtu invalid"
+    false
   fi
 
   # Check custom MAC is applied in container.
-  if ! lxc exec "${ctName}" -- grep -Fix "${ctMAC}" /sys/class/net/eth0/address ; then
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/address)" != "${ctMAC}" ]; then
     echo "mac invalid"
     false
   fi
@@ -50,15 +47,13 @@ test_container_devices_nic_physical() {
   fi
 
   # Check original MTU is restored on physical device.
-  if lxc info | grep 'network_phys_macvlan_mtu: "true"' ; then
-    if ! grep "1500" /sys/class/net/"${ctName}"/mtu ; then
-      echo "mtu invalid"
-      false
-    fi
+  if [ "$(< /sys/class/net/"${ctName}"/mtu)" != "1500" ]; then
+    echo "mtu invalid"
+    false
   fi
 
   # Check original MAC is restored on physical device.
-   if ! grep -Fix "${dummyMAC}" /sys/class/net/"${ctName}"/address ; then
+   if [ "$(< /sys/class/net/"${ctName}"/address)" != "${dummyMAC}" ]; then
     echo "mac invalid"
     false
   fi
@@ -68,15 +63,13 @@ test_container_devices_nic_physical() {
   lxc config device remove "${ctName}" eth0
 
   # Check original MTU is restored on physical device.
-  if lxc info | grep 'network_phys_macvlan_mtu: "true"' ; then
-    if ! grep "1500" /sys/class/net/"${ctName}"/mtu ; then
-      echo "mtu invalid"
-      false
-    fi
+  if [ "$(< /sys/class/net/"${ctName}"/mtu)" != "1500" ]; then
+    echo "mtu invalid"
+    false
   fi
 
   # Check original MAC is restored on physical device.
-   if ! grep -Fix "${dummyMAC}" /sys/class/net/"${ctName}"/address ; then
+   if [ "$(< /sys/class/net/"${ctName}"/address)" != "${dummyMAC}" ]; then
     echo "mac invalid"
     false
   fi
@@ -94,15 +87,13 @@ test_container_devices_nic_physical() {
     mtu=1401 #Higher than 1400 boot time value above
 
   # Check custom MTU is applied if feature available in LXD.
-  if lxc info | grep 'network_phys_macvlan_mtu: "true"' ; then
-    if ! lxc exec "${ctName}" -- grep "1401" /sys/class/net/eth0/mtu ; then
-      echo "mtu invalid"
-      false
-    fi
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/mtu)" != "1401" ]; then
+    echo "mtu invalid"
+    false
   fi
 
   # Check custom MAC is applied in container.
-  if ! lxc exec "${ctName}" -- grep -Fix "${ctMAC}" /sys/class/net/eth0/address ; then
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/address)" != "${ctMAC}" ]; then
     echo "mac invalid"
     false
   fi
@@ -111,15 +102,13 @@ test_container_devices_nic_physical() {
   lxc config device remove "${ctName}" eth0
 
   # Check original MTU is restored on physical device.
-  if lxc info | grep 'network_phys_macvlan_mtu: "true"' ; then
-    if ! grep "1500" /sys/class/net/"${ctName}"/mtu ; then
-      echo "mtu invalid"
-      false
-    fi
+  if [ "$(< /sys/class/net/"${ctName}"/mtu)" != "1500" ]; then
+    echo "mtu invalid"
+    false
   fi
 
   # Check original MAC is restored on physical device.
-   if ! grep -Fix "${dummyMAC}" /sys/class/net/"${ctName}"/address ; then
+   if [ "$(< /sys/class/net/"${ctName}"/address)" != "${dummyMAC}" ]; then
     echo "mac invalid"
     false
   fi
@@ -135,15 +124,13 @@ test_container_devices_nic_physical() {
     mtu=1402 #Higher than 1400 boot time value above
 
   # Check custom MTU is applied if feature available in LXD.
-  if lxc info | grep 'network_phys_macvlan_mtu: "true"' ; then
-    if ! lxc exec "${ctName}" -- grep "1402" /sys/class/net/eth0/mtu ; then
-      echo "mtu invalid"
-      false
-    fi
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/mtu)" != "1402" ]; then
+    echo "mtu invalid"
+    false
   fi
 
   # Check custom MAC is applied in container.
-  if ! lxc exec "${ctName}" -- grep -Fix "${ctMAC}" /sys/class/net/eth0/address ; then
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/address)" != "${ctMAC}" ]; then
     echo "mac invalid"
     false
   fi
@@ -152,15 +139,13 @@ test_container_devices_nic_physical() {
   lxc config device remove "${ctName}" eth0
 
   # Check original MTU is restored on physical device.
-  if lxc info | grep 'network_phys_macvlan_mtu: "true"' ; then
-    if ! grep "1500" /sys/class/net/"${ctName}"/mtu ; then
-      echo "mtu invalid"
-      false
-    fi
+  if [ "$(< /sys/class/net/"${ctName}"/mtu)" != "1500" ]; then
+    echo "mtu invalid"
+    false
   fi
 
   # Check original MAC is restored on physical device.
-   if ! grep -Fix "${dummyMAC}" /sys/class/net/"${ctName}"/address ; then
+   if [ "$(< /sys/class/net/"${ctName}"/address)" != "${dummyMAC}" ]; then
     echo "mac invalid"
     false
   fi
@@ -176,15 +161,13 @@ test_container_devices_nic_physical() {
   lxc stop -f "${ctName}"
 
   # Check original MTU is restored on physical device.
-  if lxc info | grep 'network_phys_macvlan_mtu: "true"' ; then
-    if ! grep "1500" /sys/class/net/"${ctName}"/mtu ; then
-      echo "mtu invalid"
-      false
-    fi
+  if [ "$(< /sys/class/net/"${ctName}"/mtu)" != "1500" ]; then
+    echo "mtu invalid"
+    false
   fi
 
   # Check original MAC is restored on physical device.
-   if ! grep -Fix "${dummyMAC}" /sys/class/net/"${ctName}"/address ; then
+   if [ "$(< /sys/class/net/"${ctName}"/address)" != "${dummyMAC}" ]; then
     echo "mac invalid"
     false
   fi
@@ -200,7 +183,7 @@ test_container_devices_nic_physical() {
     network="${networkName}"
 
   # Check that network config has been applied
-  if ! lxc config show "${ctName}" | grep "network: ${networkName}" ; then
+  if ! lxc config show "${ctName}" | grep -F "network: ${networkName}" ; then
     echo "no network configuration detected"
     false
   fi
@@ -209,11 +192,9 @@ test_container_devices_nic_physical() {
   lxc start "${ctName}"
 
   # Check custom MTU is applied if feature available in LXD.
-  if lxc info | grep 'network_phys_macvlan_mtu: "true"' ; then
-    if ! lxc exec "${ctName}" -- grep "1400" /sys/class/net/eth1/mtu ; then
-      echo "mtu invalid"
-      false
-    fi
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth1/mtu)" != "1400" ]; then
+    echo "mtu invalid"
+    false
   fi
 
   lxc delete "${ctName}" -f

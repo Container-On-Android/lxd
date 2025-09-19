@@ -9,10 +9,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/cancel"
-	"github.com/canonical/lxd/shared/entity"
 	"github.com/canonical/lxd/shared/logger"
 )
 
@@ -41,10 +39,20 @@ type Server struct {
 	listeners map[string]*Listener
 	notify    NotifyFunc
 	location  string
+
+	// logger is a [logger.Logger] that can be used while an event is being processed.
+	// This is necessary because the global [logger.Logger] is configured with a hook that will send logging events to the server.
+	// If the global logger is used while the Server is locked, the Server goes into deadlock. This logger should be used instead.
+	logger logger.Logger
 }
 
 // NewServer returns a new event server.
-func NewServer(debug bool, verbose bool, notify NotifyFunc) *Server {
+func NewServer(debug bool, verbose bool, notify NotifyFunc) (*Server, error) {
+	eventServerLogger, err := logger.New("", "", verbose, debug, nil)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to instantiate event server logger: %w", err)
+	}
+
 	server := &Server{
 		serverCommon: serverCommon{
 			debug:   debug,
@@ -52,9 +60,10 @@ func NewServer(debug bool, verbose bool, notify NotifyFunc) *Server {
 		},
 		listeners: map[string]*Listener{},
 		notify:    notify,
+		logger:    eventServerLogger,
 	}
 
-	return server
+	return server, nil
 }
 
 // SetLocalLocation sets the local location of this member.
@@ -66,14 +75,18 @@ func (s *Server) SetLocalLocation(location string) {
 	s.location = location
 }
 
-// AddListener creates and returns a new event listener.
-func (s *Server) AddListener(projectName string, allProjects bool, projectPermissionFunc auth.PermissionChecker, connection EventListenerConnection, messageTypes []string, excludeSources []EventSource, recvFunc EventHandler, excludeLocations []string) (*Listener, error) {
+// AddListener creates and returns a new event listener. The filter argument must return true to include the event and
+// false to omit the event.
+//
+// Warn: The filter must not call the default logger or send any events of its own. Otherwise, the event server will
+// deadlock when it tries to broadcast the logging event.
+func (s *Server) AddListener(projectName string, allProjects bool, filter func(logger.Logger, api.Event) bool, connection EventListenerConnection, messageTypes []string, excludeSources []EventSource, recvFunc EventHandler, excludeLocations []string) (*Listener, error) {
 	if allProjects && projectName != "" {
 		return nil, errors.New("Cannot specify project name when listening for events on all projects")
 	}
 
-	if projectPermissionFunc == nil {
-		projectPermissionFunc = func(*api.URL) bool {
+	if filter == nil {
+		filter = func(logger.Logger, api.Event) bool {
 			return true
 		}
 	}
@@ -87,11 +100,11 @@ func (s *Server) AddListener(projectName string, allProjects bool, projectPermis
 			recvFunc:                recvFunc,
 		},
 
-		allProjects:           allProjects,
-		projectName:           projectName,
-		projectPermissionFunc: projectPermissionFunc,
-		excludeSources:        excludeSources,
-		excludeLocations:      excludeLocations,
+		allProjects:      allProjects,
+		projectName:      projectName,
+		filter:           filter,
+		excludeSources:   excludeSources,
+		excludeLocations: excludeLocations,
 	}
 
 	s.lock.Lock()
@@ -175,15 +188,11 @@ func (s *Server) broadcast(event api.Event, eventSource EventSource) error {
 		s.notify(event)
 	}
 
+	filterLogger := s.logger.AddContext(logger.Ctx{"source": eventSource})
 	listeners := s.listeners
 	for _, listener := range listeners {
 		// If the event is project specific, check if the listener is requesting events from that project.
 		if event.Project != "" && !listener.allProjects && event.Project != listener.projectName {
-			continue
-		}
-
-		// If the event is project specific, ensure we have permission to view it.
-		if event.Project != "" && !listener.projectPermissionFunc(entity.ProjectURL(event.Project)) {
 			continue
 		}
 
@@ -197,6 +206,11 @@ func (s *Server) broadcast(event api.Event, eventSource EventSource) error {
 
 		// If the event doesn't come from this member and has been excluded by listener, don't deliver it.
 		if eventSource != EventSourceLocal && slices.Contains(listener.excludeLocations, event.Location) {
+			continue
+		}
+
+		// Apply any further filters.
+		if !listener.filter(filterLogger, event) {
 			continue
 		}
 
@@ -236,9 +250,9 @@ func (s *Server) broadcast(event api.Event, eventSource EventSource) error {
 type Listener struct {
 	listenerCommon
 
-	allProjects           bool
-	projectName           string
-	projectPermissionFunc auth.PermissionChecker
-	excludeSources        []EventSource
-	excludeLocations      []string
+	allProjects      bool
+	projectName      string
+	filter           func(logger.Logger, api.Event) bool
+	excludeSources   []EventSource
+	excludeLocations []string
 }

@@ -64,7 +64,7 @@ type profileDetails struct {
 	effectiveProject api.Project
 }
 
-// addProfileDetailsToRequestContext sets request.CtxEffectiveProjectName (string) and ctxProfileDetails (profileDetails)
+// addProfileDetailsToRequestContext sets the effective project in the request.Info and sets ctxProfileDetails (profileDetails)
 // in the request context.
 func addProfileDetailsToRequestContext(s *state.State, r *http.Request) error {
 	profileName, err := url.PathUnescape(mux.Vars(r)["name"])
@@ -78,9 +78,7 @@ func addProfileDetailsToRequestContext(s *state.State, r *http.Request) error {
 		return fmt.Errorf("Failed to check project %q profile feature: %w", requestProjectName, err)
 	}
 
-	reqInfo := request.SetupContextInfo(r)
-	reqInfo.EffectiveProjectName = effectiveProject.Name
-
+	request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProject.Name)
 	request.SetContextValue(r, ctxProfileDetails, profileDetails{
 		profileName:      profileName,
 		effectiveProject: *effectiveProject,
@@ -218,17 +216,20 @@ func profileAccessHandler(entitlement auth.Entitlement) func(d *Daemon, r *http.
 func profilesGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	requestProjectName := request.ProjectParam(r)
-	allProjects := shared.IsTrue(request.QueryParam(r, "all-projects"))
-
-	// requestProjectName is only valid for project specific requests.
-	if allProjects && requestProjectName != api.ProjectDefaultName {
-		return response.BadRequest(errors.New("Cannot specify a project when requesting all projects"))
-	}
-
-	p, err := project.ProfileProject(s.DB.Cluster, requestProjectName)
+	requestProjectName, allProjects, err := request.ProjectParams(r)
 	if err != nil {
 		return response.SmartError(err)
+	}
+
+	var effectiveProjectName string
+	if !allProjects {
+		p, err := project.ProfileProject(s.DB.Cluster, requestProjectName)
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		effectiveProjectName = p.Name
+		request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
 	}
 
 	recursion := util.IsRecursionRequest(r)
@@ -236,9 +237,6 @@ func profilesGet(d *Daemon, r *http.Request) response.Response {
 	if err != nil {
 		return response.SmartError(err)
 	}
-
-	reqInfo := request.SetupContextInfo(r)
-	reqInfo.EffectiveProjectName = p.Name
 
 	userHasPermission, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeProfile)
 	if err != nil {
@@ -252,7 +250,7 @@ func profilesGet(d *Daemon, r *http.Request) response.Response {
 		var profiles []dbCluster.Profile
 		if !allProjects {
 			filter := dbCluster.ProfileFilter{
-				Project: &p.Name,
+				Project: &effectiveProjectName,
 			}
 
 			profiles, err = dbCluster.GetProfiles(ctx, tx.Tx(), filter)
@@ -321,7 +319,7 @@ func profilesGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	if len(withEntitlements) > 0 {
-		err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeProfile, withEntitlements, urlToProfile)
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeProfile, withEntitlements, urlToProfile)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -552,7 +550,7 @@ func profileGet(d *Daemon, r *http.Request) response.Response {
 	resp.UsedBy = project.FilterUsedBy(r.Context(), s.Authorizer, resp.UsedBy)
 
 	if len(withEntitlements) > 0 {
-		err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeProfile, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.ProfileURL(details.effectiveProject.Name, details.profileName): resp})
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeProfile, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.ProfileURL(details.effectiveProject.Name, details.profileName): resp})
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -604,7 +602,14 @@ func profilePut(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	if isClusterNotification(r) {
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	clusterNotification := requestor.IsClusterNotification()
+
+	if clusterNotification {
 		// In this case the ProfilePut request payload contains information about the old profile, since
 		// the new one has already been saved in the database.
 		old := api.ProfilePut{}
@@ -617,7 +622,6 @@ func profilePut(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	var id int64
 	var profile *api.Profile
 
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -630,8 +634,6 @@ func profilePut(d *Daemon, r *http.Request) response.Response {
 		if err != nil {
 			return err
 		}
-
-		id = int64(current.ID)
 
 		return nil
 	})
@@ -652,9 +654,9 @@ func profilePut(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	err = doProfileUpdate(r.Context(), s, details.effectiveProject, details.profileName, id, profile, req)
+	err = doProfileUpdate(r.Context(), s, details.effectiveProject, details.profileName, profile, req)
 
-	if err == nil && !isClusterNotification(r) {
+	if err == nil && !clusterNotification {
 		// Notify all other nodes. If a node is down, it will be ignored.
 		notifier, err := cluster.NewNotifier(s, s.Endpoints.NetworkCert(), s.ServerCert(), cluster.NotifyAlive)
 		if err != nil {
@@ -669,8 +671,7 @@ func profilePut(d *Daemon, r *http.Request) response.Response {
 		}
 	}
 
-	requestor := request.CreateRequestor(r.Context())
-	s.Events.SendLifecycle(details.effectiveProject.Name, lifecycle.ProfileUpdated.Event(details.profileName, details.effectiveProject.Name, requestor, nil))
+	s.Events.SendLifecycle(details.effectiveProject.Name, lifecycle.ProfileUpdated.Event(details.profileName, details.effectiveProject.Name, requestor.EventLifecycleRequestor(), nil))
 
 	return response.SmartError(err)
 }
@@ -717,7 +718,6 @@ func profilePatch(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	var id int64
 	var profile *api.Profile
 
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -730,8 +730,6 @@ func profilePatch(d *Daemon, r *http.Request) response.Response {
 		if err != nil {
 			return err
 		}
-
-		id = int64(current.ID)
 
 		return nil
 	})
@@ -799,7 +797,7 @@ func profilePatch(d *Daemon, r *http.Request) response.Response {
 	requestor := request.CreateRequestor(r.Context())
 	s.Events.SendLifecycle(details.effectiveProject.Name, lifecycle.ProfileUpdated.Event(details.profileName, details.effectiveProject.Name, requestor, nil))
 
-	return response.SmartError(doProfileUpdate(r.Context(), s, details.effectiveProject, details.profileName, id, profile, req))
+	return response.SmartError(doProfileUpdate(r.Context(), s, details.effectiveProject, details.profileName, profile, req))
 }
 
 // swagger:operation POST /1.0/profiles/{name} profiles profile_post
@@ -917,12 +915,22 @@ func profileDelete(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	if details.profileName == "default" {
-		return response.Forbidden(errors.New(`The "default" profile cannot be deleted`))
+	err = doProfileDelete(r.Context(), s, details.profileName, details.effectiveProject.Name)
+	if err != nil {
+		return response.SmartError(err)
 	}
 
-	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
-		profile, err := dbCluster.GetProfile(ctx, tx.Tx(), details.effectiveProject.Name, details.profileName)
+	return response.EmptySyncResponse
+}
+
+// doProfileDelete deletes a named profile in the given project.
+func doProfileDelete(ctx context.Context, s *state.State, name string, effectiveProjectName string) error {
+	if name == "default" {
+		return api.NewStatusError(http.StatusForbidden, `The "default" profile cannot be deleted`)
+	}
+
+	err := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		profile, err := dbCluster.GetProfile(ctx, tx.Tx(), effectiveProjectName, name)
 		if err != nil {
 			return err
 		}
@@ -933,17 +941,17 @@ func profileDelete(d *Daemon, r *http.Request) response.Response {
 		}
 
 		if len(usedBy) > 0 {
-			return errors.New("Profile is currently in use")
+			return api.NewStatusError(http.StatusBadRequest, "Profile is currently in use")
 		}
 
-		return dbCluster.DeleteProfile(ctx, tx.Tx(), details.effectiveProject.Name, details.profileName)
+		return dbCluster.DeleteProfile(ctx, tx.Tx(), effectiveProjectName, name)
 	})
 	if err != nil {
-		return response.SmartError(err)
+		return err
 	}
 
-	requestor := request.CreateRequestor(r.Context())
-	s.Events.SendLifecycle(details.effectiveProject.Name, lifecycle.ProfileDeleted.Event(details.profileName, details.effectiveProject.Name, requestor, nil))
+	eventLifecycleRequestor := request.CreateRequestor(ctx)
+	s.Events.SendLifecycle(effectiveProjectName, lifecycle.ProfileDeleted.Event(name, effectiveProjectName, eventLifecycleRequestor, nil))
 
-	return response.EmptySyncResponse
+	return nil
 }

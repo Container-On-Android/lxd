@@ -29,11 +29,12 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/kballard/go-shellquote"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/cluster"
+	"github.com/canonical/lxd/lxd/config"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/operationtype"
@@ -65,7 +66,7 @@ var imagesCmd = APIEndpoint{
 	MetricsType: entity.TypeImage,
 
 	Get:  APIEndpointAction{Handler: imagesGet, AllowUntrusted: true},
-	Post: APIEndpointAction{Handler: imagesPost, AllowUntrusted: true},
+	Post: APIEndpointAction{Handler: imagesPost, AllowUntrusted: true, ContentTypes: []string{"application/json", "application/octet-stream", "multipart/form-data"}},
 }
 
 var imageCmd = APIEndpoint{
@@ -119,6 +120,28 @@ var imageAliasCmd = APIEndpoint{
 	Put:    APIEndpointAction{Handler: imageAliasPut, AccessHandler: imageAliasAccessHandler(auth.EntitlementCanEdit)},
 }
 
+// validateImageFingerprintPrefix validates that the given string is at least 12 characters long contains only lowercase
+// hex characters.
+func validateImageFingerprintPrefix(prefix string) error {
+	// 12 characters is chosen because this is the length of the fingerprint as displayed in the CLI when listing images.
+	if len(prefix) < 12 {
+		return api.NewStatusError(http.StatusBadRequest, "Image fingerprint prefix must contain 12 characters or more")
+	}
+
+	if len(prefix) > 64 {
+		return api.NewStatusError(http.StatusBadRequest, "Image fingerprint cannot be longer than 64 characters")
+	}
+
+	// Prefixes containing non-hex or uppercase characters can never match an image.
+	for _, b := range []byte(prefix) {
+		if (b < '0' || b > '9') && (b < 'a' || b > 'f') {
+			return api.NewStatusError(http.StatusBadRequest, "Image fingerprint prefix must contain only lowercase hexadecimal characters")
+		}
+	}
+
+	return nil
+}
+
 const ctxImageDetails request.CtxKey = "image-details"
 
 // imageDetails contains fields that are determined prior to the access check. This is set in the request context when
@@ -129,10 +152,15 @@ type imageDetails struct {
 	image                  api.Image
 }
 
-// addImageDetailsToRequestContext sets request.CtxEffectiveProjectName (string) and ctxImageDetails (imageDetails)
+// addImageDetailsToRequestContext sets the effective project in the request.Info and sets ctxImageDetails (imageDetails)
 // in the request context.
 func addImageDetailsToRequestContext(s *state.State, r *http.Request) error {
 	imageFingerprintPrefix, err := url.PathUnescape(mux.Vars(r)["fingerprint"])
+	if err != nil {
+		return err
+	}
+
+	err = validateImageFingerprintPrefix(imageFingerprintPrefix)
 	if err != nil {
 		return err
 	}
@@ -158,14 +186,12 @@ func addImageDetailsToRequestContext(s *state.State, r *http.Request) error {
 		return fmt.Errorf("Failed to check project %q image feature: %w", requestProjectName, err)
 	}
 
+	request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
 	request.SetContextValue(r, ctxImageDetails, imageDetails{
 		imageFingerprintPrefix: imageFingerprintPrefix,
 		imageID:                imageID,
 		image:                  *image,
 	})
-
-	reqInfo := request.SetupContextInfo(r)
-	reqInfo.EffectiveProjectName = effectiveProjectName
 
 	return nil
 }
@@ -212,9 +238,7 @@ func imageAliasAccessHandler(entitlement auth.Entitlement) func(d *Daemon, r *ht
 			return response.SmartError(err)
 		}
 
-		reqInfo := request.SetupContextInfo(r)
-		reqInfo.EffectiveProjectName = effectiveProjectName
-
+		request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
 		err = s.Authorizer.CheckPermission(r.Context(), entity.ImageAliasURL(requestProjectName, imageAliasName), entitlement)
 		if err != nil {
 			return response.SmartError(err)
@@ -388,7 +412,7 @@ func imgPostInstanceInfo(s *state.State, req api.ImagesPost, op *operations.Oper
 					processed = value
 				}
 
-				shared.SetProgressMetadata(metadata, "create_image_from_container_pack", "Image pack", percent, processed, speed)
+				shared.SetProgressMetadata(metadata, "create_image_from_instance_pack", "Image pack", percent, processed, speed)
 				_ = op.UpdateMetadata(metadata)
 			},
 			Length: totalSize,
@@ -450,7 +474,7 @@ func imgPostInstanceInfo(s *state.State, req api.ImagesPost, op *operations.Oper
 	// Tracker instance for the export phase.
 	tracker := &ioprogress.ProgressTracker{
 		Handler: func(value, speed int64) {
-			shared.SetProgressMetadata(metadata, "create_image_from_container_pack", "Exporting", value, 0, 0)
+			shared.SetProgressMetadata(metadata, "create_image_from_instance_pack", "Exporting", value, 0, 0)
 			_ = op.UpdateMetadata(metadata)
 		},
 	}
@@ -506,7 +530,7 @@ func imgPostInstanceInfo(s *state.State, req api.ImagesPost, op *operations.Oper
 	}
 
 	/* rename the file to the expected name so our caller can use it */
-	finalName := filepath.Join(s.ImagesStoragePath(), info.Fingerprint)
+	finalName := filepath.Join(s.ImagesStoragePath(projectName), info.Fingerprint)
 	err = shared.FileMove(imageFile.Name(), finalName)
 	if err != nil {
 		return nil, err
@@ -830,7 +854,7 @@ func getImgPostInfo(s *state.State, r *http.Request, builddir string, project st
 		info.Type = imageType
 	}
 
-	imgfname := filepath.Join(s.ImagesStoragePath(), info.Fingerprint)
+	imgfname := filepath.Join(s.ImagesStoragePath(project), info.Fingerprint)
 	err = shared.FileMove(imageTmpFilename, imgfname)
 	if err != nil {
 		l.Error("Failed to move the image tarfile", logger.Ctx{
@@ -920,10 +944,15 @@ func getImgPostInfo(s *state.State, r *http.Request, builddir string, project st
 		return nil, err
 	}
 
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return nil, err
+	}
+
 	if exists {
 		// Do not create a database entry if the request is coming from the internal
 		// cluster communications for image synchronization
-		if !isClusterNotification(r) {
+		if !requestor.IsClusterNotification() {
 			return &info, errors.New("Image with same fingerprint already exists")
 		}
 
@@ -958,7 +987,7 @@ func getImgPostInfo(s *state.State, r *http.Request, builddir string, project st
 // the image. No entry in the images database will be created. This implies that
 // imageCreateinPool() should only be called when an image already exists in the
 // database and hence has already a storage volume in at least one storage pool.
-func imageCreateInPool(s *state.State, info *api.Image, storagePool string) error {
+func imageCreateInPool(s *state.State, info *api.Image, storagePool string, projectName string) error {
 	if storagePool == "" {
 		return errors.New("No storage pool specified")
 	}
@@ -968,7 +997,7 @@ func imageCreateInPool(s *state.State, info *api.Image, storagePool string) erro
 		return err
 	}
 
-	err = pool.EnsureImage(info.Fingerprint, nil)
+	err = pool.EnsureImage(info.Fingerprint, nil, projectName)
 	if err != nil {
 		return err
 	}
@@ -1021,6 +1050,8 @@ func imageCreateInPool(s *state.State, info *api.Image, storagePool string) erro
 //	---
 //	consumes:
 //	  - application/json
+//	  - application/octet-stream
+//	  - multipart/form-data
 //	produces:
 //	  - application/json
 //	parameters:
@@ -1097,6 +1128,20 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 		userCanCreateImages = true
 	}
 
+	// Load the project entry so we have a valid project name.
+	var dbProject *dbCluster.Project
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		dbProject, err = dbCluster.GetProject(ctx, tx.Tx(), projectName)
+		if err != nil {
+			return fmt.Errorf("Failed loading project %q: %w", projectName, err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	secret := r.Header.Get("X-LXD-secret")
 	fingerprint := r.Header.Get("X-LXD-fingerprint")
 
@@ -1108,7 +1153,7 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// We need to invalidate the secret whether the source is trusted or not.
-	op, err := imageValidSecret(s, r, projectName, fingerprint, secret)
+	op, err := imageValidSecret(s, r, dbProject.Name, fingerprint, secret)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -1125,7 +1170,7 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// create a directory under which we keep everything while building
-	builddir, err := os.MkdirTemp(s.ImagesStoragePath(), "lxd_build_")
+	builddir, err := os.MkdirTemp(s.ImagesStoragePath(dbProject.Name), "lxd_build_")
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -1152,7 +1197,7 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 	// allowed to use.
 	var budget int64
 	err = s.DB.Cluster.Transaction(s.ShutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
-		budget, err = limits.GetImageSpaceBudget(ctx, s.GlobalConfig, tx, projectName)
+		budget, err = limits.GetImageSpaceBudget(ctx, s.GlobalConfig, tx, dbProject.Name)
 		return err
 	})
 	if err != nil {
@@ -1196,7 +1241,7 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 			"public":     req.Public,
 		}
 
-		return createTokenResponse(s, r, projectName, req.Source.Fingerprint, metadata)
+		return createTokenResponse(s, r, dbProject.Name, req.Source.Fingerprint, metadata)
 	}
 
 	if !imageUpload && !slices.Contains([]string{"container", "instance", "virtual-machine", "snapshot", "image", "url"}, req.Source.Type) {
@@ -1214,7 +1259,7 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 			}
 
 			r.Body = post
-			resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, projectName, name, instanceType)
+			resp, err := forwardedResponseIfInstanceIsRemote(r.Context(), s, dbProject.Name, name, instanceType)
 			if err != nil {
 				cleanup(builddir, post)
 				return response.SmartError(err)
@@ -1227,6 +1272,13 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 		}
 	}
 
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	isClusterNotification := requestor.IsClusterNotification()
+
 	// Begin background operation
 	run := func(op *operations.Operation) error {
 		var err error
@@ -1237,19 +1289,19 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 
 		if imageUpload {
 			/* Processing image upload */
-			info, err = getImgPostInfo(s, r, builddir, projectName, post, imageMetadata)
+			info, err = getImgPostInfo(s, r, builddir, dbProject.Name, post, imageMetadata)
 		} else {
 			switch req.Source.Type {
 			case api.SourceTypeImage:
 				/* Processing image copy from remote */
-				info, err = imgPostRemoteInfo(r.Context(), s, req, op, projectName, budget)
+				info, err = imgPostRemoteInfo(r.Context(), s, req, op, dbProject.Name, budget)
 			case "url":
 				/* Processing image copy from URL */
-				info, err = imgPostURLInfo(r.Context(), s, req, op, projectName, budget)
+				info, err = imgPostURLInfo(r.Context(), s, req, op, dbProject.Name, budget)
 			default:
 				/* Processing image creation from container */
 				imagePublishLock.Lock()
-				info, err = imgPostInstanceInfo(s, req, op, projectName, builddir, budget)
+				info, err = imgPostInstanceInfo(s, req, op, dbProject.Name, builddir, budget)
 				imagePublishLock.Unlock()
 			}
 		}
@@ -1276,7 +1328,7 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 			return err
 		}
 
-		if isClusterNotification(r) {
+		if isClusterNotification {
 			// If dealing with in-cluster image copy, don't touch the database.
 			return nil
 		}
@@ -1291,13 +1343,13 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 		}
 
 		err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-			imgID, _, err := tx.GetImageByFingerprintPrefix(ctx, info.Fingerprint, dbCluster.ImageFilter{Project: &projectName})
+			imgID, _, err := tx.GetImageByFingerprintPrefix(ctx, info.Fingerprint, dbCluster.ImageFilter{Project: &dbProject.Name})
 			if err != nil {
 				return fmt.Errorf("Fetch image %q: %w", info.Fingerprint, err)
 			}
 
 			for _, alias := range req.Aliases {
-				_, _, err := tx.GetImageAlias(ctx, projectName, alias.Name, true)
+				_, _, err := tx.GetImageAlias(ctx, dbProject.Name, alias.Name, true)
 				if !response.IsNotFoundError(err) {
 					if err != nil {
 						return fmt.Errorf("Fetch image alias %q: %w", alias.Name, err)
@@ -1306,7 +1358,7 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 					return fmt.Errorf("Alias already exists: %s", alias.Name)
 				}
 
-				err = tx.CreateImageAlias(ctx, projectName, alias.Name, imgID, alias.Description)
+				err = tx.CreateImageAlias(ctx, dbProject.Name, alias.Name, imgID, alias.Description)
 				if err != nil {
 					return fmt.Errorf("Add new image alias to the database: %w", err)
 				}
@@ -1319,12 +1371,12 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 		}
 
 		// Sync the images between each node in the cluster on demand
-		err = imageSyncBetweenNodes(s.ShutdownCtx, s, r, projectName, info.Fingerprint)
+		err = imageSyncBetweenNodes(s.ShutdownCtx, s, r, dbProject.Name, info.Fingerprint)
 		if err != nil {
 			return fmt.Errorf("Failed syncing image between nodes: %w", err)
 		}
 
-		s.Events.SendLifecycle(projectName, lifecycle.ImageCreated.Event(info.Fingerprint, projectName, op.Requestor(), logger.Ctx{"type": info.Type}))
+		s.Events.SendLifecycle(dbProject.Name, lifecycle.ImageCreated.Event(info.Fingerprint, dbProject.Name, op.EventLifecycleRequestor(), logger.Ctx{"type": info.Type}))
 
 		return nil
 	}
@@ -1340,7 +1392,7 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 		}
 	}
 
-	imageOp, err := operations.OperationCreate(r.Context(), s, projectName, operations.OperationClassTask, operationtype.ImageDownload, nil, metadata, run, nil, nil)
+	imageOp, err := operations.OperationCreate(r.Context(), s, dbProject.Name, operations.OperationClassTask, operationtype.ImageDownload, nil, metadata, run, nil, nil)
 	if err != nil {
 		cleanup(builddir, post)
 		return response.InternalError(err)
@@ -1765,8 +1817,6 @@ func doImagesGet(ctx context.Context, tx *db.ClusterTx, recursion bool, projectN
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imagesGet(d *Daemon, r *http.Request) response.Response {
-	projectName := request.ProjectParam(r)
-	allProjects := shared.IsTrue(r.FormValue("all-projects"))
 	filterStr := r.FormValue("filter")
 
 	recursion := util.IsRecursionRequest(r)
@@ -1775,33 +1825,51 @@ func imagesGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	// ProjectParam returns default if not set
-	if allProjects && projectName != api.ProjectDefaultName {
-		return response.BadRequest(errors.New("Cannot specify a project when requesting all projects"))
-	}
-
-	s := d.State()
-	var effectiveProjectName string
-	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
-		var err error
-		effectiveProjectName, err = projectutils.ImageProject(ctx, tx.Tx(), projectName)
-		return err
-	})
+	projectName, allProjects, err := request.ProjectParams(r)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	reqInfo := request.SetupContextInfo(r)
-	reqInfo.EffectiveProjectName = effectiveProjectName
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
 
-	// If the caller is not trusted, we only want to list public images in the default project.
-	trusted := auth.IsTrusted(r.Context())
-	publicOnly := !trusted
+	trusted := requestor.IsTrusted()
 
 	// Untrusted callers can't request images from all projects or projects other than default.
-	if !trusted && (allProjects || projectName != api.ProjectDefaultName) {
-		return response.Forbidden(errors.New("Untrusted callers may only access public images in the default project"))
+	if !trusted {
+		if allProjects {
+			return response.Forbidden(errors.New("Untrusted callers may only access public images in the default project"))
+		}
+
+		if projectName != api.ProjectDefaultName {
+			return response.NotFound(nil)
+		}
 	}
+
+	s := d.State()
+	if !allProjects && trusted {
+		var effectiveProjectName string
+		err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+			effectiveProjectName, err = projectutils.ImageProject(ctx, tx.Tx(), projectName)
+			return err
+		})
+		if err != nil {
+			if api.StatusErrorCheck(err, http.StatusNotFound) {
+				// Return a generic not found so that the caller cannot determine the existence of a project by the
+				// contents of the error message.
+				return response.NotFound(nil)
+			}
+
+			return response.SmartError(err)
+		}
+
+		request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
+	}
+
+	// If the caller is not trusted, we only want to list public images in the default project.
+	publicOnly := !trusted
 
 	// Get a permission checker. If the caller is not authenticated, the permission checker will deny all.
 	// However, the permission checker is only called when an image is private. Both trusted and untrusted clients will
@@ -1844,7 +1912,7 @@ func imagesGet(d *Daemon, r *http.Request) response.Response {
 			urlToImage[entity.ImageURL(image.Project, image.Fingerprint)] = image
 		}
 
-		err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeImage, withEntitlements, urlToImage)
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeImage, withEntitlements, urlToImage)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -2034,10 +2102,11 @@ func distributeImage(ctx context.Context, s *state.State, nodes []db.NodeInfo, o
 	// If the option is set, only distribute the image once to nodes with this
 	// specific pool/volume.
 
-	// imageVolumes is a list containing of all image volumes specified by
-	// storage.images_volume. Since this option is node specific, the values
+	// volumesWhichAlreadyHaveImage is a list of all image volumes specified by
+	// storage.images_volume which are remote, and thus the image was already distributed
+	// there by the main node. Since this option is node specific, the values
 	// may be different for each cluster member.
-	var imageVolumes []string
+	var volumesWhichAlreadyHaveImage []string
 
 	err := s.DB.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
 		config, err := node.ConfigLoad(ctx, tx)
@@ -2045,7 +2114,7 @@ func distributeImage(ctx context.Context, s *state.State, nodes []db.NodeInfo, o
 			return err
 		}
 
-		vol := config.StorageImagesVolume()
+		vol := config.StorageImagesVolume(newImage.Project)
 		if vol != "" {
 			fields := strings.Split(vol, "/")
 
@@ -2063,7 +2132,7 @@ func distributeImage(ctx context.Context, s *state.State, nodes []db.NodeInfo, o
 			// Add the volume to the list if the pool is backed by remote
 			// storage as only then the volumes are shared.
 			if slices.Contains(db.StorageRemoteDriverNames(), pool.Driver) {
-				imageVolumes = append(imageVolumes, vol)
+				volumesWhichAlreadyHaveImage = append(volumesWhichAlreadyHaveImage, vol)
 			}
 		}
 
@@ -2122,7 +2191,11 @@ func distributeImage(ctx context.Context, s *state.State, nodes []db.NodeInfo, o
 			} else {
 				vol := ""
 
-				val := resp.Config["storage.images_volume"]
+				val := resp.Config["storage.project."+newImage.Project+".images_volume"]
+				if val == nil {
+					val = resp.Config["storage.images_volume"]
+				}
+
 				if val != nil {
 					var ok bool
 					vol, ok = val.(string)
@@ -2136,7 +2209,7 @@ func distributeImage(ctx context.Context, s *state.State, nodes []db.NodeInfo, o
 				// skip distributing the image to this cluster member.
 				// If the option is unset, distribute the image.
 				if vol != "" {
-					if slices.Contains(imageVolumes, vol) {
+					if slices.Contains(volumesWhichAlreadyHaveImage, vol) {
 						return nil
 					}
 
@@ -2147,13 +2220,13 @@ func distributeImage(ctx context.Context, s *state.State, nodes []db.NodeInfo, o
 						logger.Error("Failed to get storage pool info", logger.Ctx{"err": err, "pool": fields[0]})
 					} else {
 						if slices.Contains(db.StorageRemoteDriverNames(), pool.Driver) {
-							imageVolumes = append(imageVolumes, vol)
+							volumesWhichAlreadyHaveImage = append(volumesWhichAlreadyHaveImage, vol)
 						}
 					}
 				}
 			}
 
-			imageMetaPath := filepath.Join(s.ImagesStoragePath(), newImage.Fingerprint)
+			imageMetaPath := filepath.Join(s.ImagesStoragePath(newImage.Project), newImage.Fingerprint)
 			imageRootfsPath := imageMetaPath + ".rootfs"
 
 			metaFile, err := os.Open(imageMetaPath)
@@ -2208,8 +2281,9 @@ func distributeImage(ctx context.Context, s *state.State, nodes []db.NodeInfo, o
 				}
 
 				req := internalImageOptimizePost{
-					Image: *newImage,
-					Pool:  poolName,
+					Image:   *newImage,
+					Pool:    poolName,
+					Project: newImage.Project,
 				}
 
 				_, _, err = client.RawQuery(http.MethodPost, "/internal/image-optimize", req, "")
@@ -2326,7 +2400,7 @@ func autoUpdateImage(ctx context.Context, s *state.State, op *operations.Operati
 
 		// Sent a lifecycle event if the refresh actually happened.
 		if result {
-			s.Events.SendLifecycle(projectName, lifecycle.ImageRefreshed.Event(fingerprint, projectName, op.Requestor(), nil))
+			s.Events.SendLifecycle(projectName, lifecycle.ImageRefreshed.Event(fingerprint, projectName, op.EventLifecycleRequestor(), nil))
 		}
 	}
 
@@ -2436,22 +2510,10 @@ func autoUpdateImage(ctx context.Context, s *state.State, op *operations.Operati
 		return nil, nil
 	}
 
-	// Remove main image file.
-	fname := filepath.Join(s.ImagesStoragePath(), fingerprint)
-	if shared.PathExists(fname) {
-		err = os.Remove(fname)
-		if err != nil {
-			logger.Error("Error deleting image file", logger.Ctx{"fingerprint": fingerprint, "file": fname, "err": err})
-		}
-	}
-
-	// Remove the rootfs file for the image.
-	fname = fname + ".rootfs"
-	if shared.PathExists(fname) {
-		err = os.Remove(fname)
-		if err != nil {
-			logger.Error("Error deleting image rootfs file", logger.Ctx{"fingerprint": fingerprint, "file": fname, "err": err})
-		}
+	// Remove main image file and rootfs file from disk.
+	err = imageDeleteFromDisk(s.ImagesStoragePath(projectName), fingerprint)
+	if err != nil {
+		logger.Error("Failed deleting image from disk", logger.Ctx{"project": projectName, "fingerprint": fingerprint, "err": err})
 	}
 
 	setRefreshResult(true)
@@ -2512,73 +2574,98 @@ func pruneExpiredImagesTask(stateFunc func() *state.State) (task.Func, task.Sche
 }
 
 func pruneLeftoverImages(s *state.State) {
-	opRun := func(op *operations.Operation) error {
-		// Check if dealing with shared image storage.
-		var storageImages string
-		err := s.DB.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
-			nodeConfig, err := node.ConfigLoad(ctx, tx)
-			if err != nil {
-				return err
-			}
+	isMultiNodeVolume := func(volume string) (bool, error) {
+		if volume == "" {
+			return false, nil
+		}
 
-			storageImages = nodeConfig.StorageImagesVolume()
-
-			return nil
-		})
+		// Parse the source.
+		poolName, _, err := daemonStorageSplitVolume(volume)
 		if err != nil {
-			return err
+			return false, err
 		}
 
-		if storageImages != "" {
-			// Parse the source.
-			poolName, _, err := daemonStorageSplitVolume(storageImages)
-			if err != nil {
-				return err
-			}
-
-			// Load the pool.
-			pool, err := storagePools.LoadByName(s, poolName)
-			if err != nil {
-				return err
-			}
-
-			// Skip cleanup if image volume may be multi-node.
-			// When such a volume is used, we may have images that are
-			// tied to other servers in the shared images folder and don't want to
-			// delete those.
-			if pool.Driver().Info().VolumeMultiNode {
-				return nil
-			}
+		// Load the pool.
+		pool, err := storagePools.LoadByName(s, poolName)
+		if err != nil {
+			return false, err
 		}
 
-		// Get all images
-		var images []string
-		err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		return pool.Driver().Info().VolumeMultiNode, nil
+	}
+
+	opRun := func(op *operations.Operation) error {
+		// Get all projects and images
+		var imagesOnNode map[string][]string
+		var projects []string
+		err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 			var err error
-			images, err = tx.GetLocalImagesFingerprints(ctx)
+			imagesOnNode, err = tx.GetImagesOnLocalNode(ctx)
+			if err != nil {
+				return err
+			}
+
+			projects, err = dbCluster.GetProjectNames(ctx, tx.Tx())
 			return err
 		})
 		if err != nil {
 			return fmt.Errorf("Unable to retrieve the list of images: %w", err)
 		}
 
-		// Look at what's in the images directory
-		imagesDir := s.ImagesStoragePath()
-		entries, err := os.ReadDir(imagesDir)
-		if err != nil {
-			return fmt.Errorf("Unable to list the images directory: %w", err)
+		// First get list of storage volumes we'll be pruning images from.
+		imagesInStorageVolumes := make(map[string][]string)
+		// Make sure to include default daemon storage
+		imagesInStorageVolumes[s.LocalConfig.StorageImagesVolume("")] = make([]string, 0)
+		// And include all of the possibly configured project images storages too
+		for _, project := range projects {
+			storageVolume := s.LocalConfig.StorageImagesVolume(project)
+			_, ok := imagesInStorageVolumes[storageVolume]
+			if !ok {
+				imagesInStorageVolumes[storageVolume] = make([]string, 0)
+			}
 		}
 
-		// Check and delete leftovers
-		for _, entry := range entries {
-			fp := strings.Split(entry.Name(), ".")[0]
-			if !slices.Contains(images, fp) {
-				err = os.RemoveAll(filepath.Join(imagesDir, entry.Name()))
-				if err != nil {
-					return fmt.Errorf("Unable to remove leftover image: %v: %w", entry.Name(), err)
-				}
+		// Get a list of image storage volumes, with a list of images per each storage volume.
+		for image, projects := range imagesOnNode {
+			for _, project := range projects {
+				storageVolume := s.LocalConfig.StorageImagesVolume(project)
+				imagesInStorageVolumes[storageVolume] = append(imagesInStorageVolumes[storageVolume], image)
+			}
+		}
 
-				logger.Debugf("Removed leftover image file: %s", entry.Name())
+		// Now walk all these image volumes and make sure these only contain the images they should.
+		for volume, images := range imagesInStorageVolumes {
+			isShared, err := isMultiNodeVolume(volume)
+			if err != nil {
+				return err
+			}
+
+			// Check if dealing with shared image storage.
+			// Skip cleanup if image volume may be multi-node. When such a volume is used,
+			// we may have images that are tied to other servers in the shared images folder
+			// and don't want to delete those.
+			if isShared {
+				continue
+			}
+
+			// Look at what's in the images directory
+			imagesDir := daemonStoragePath(volume, config.DaemonStorageTypeImages)
+			entries, err := os.ReadDir(imagesDir)
+			if err != nil {
+				return fmt.Errorf("Unable to list the images directory: %w", err)
+			}
+
+			// Check and delete leftovers
+			for _, entry := range entries {
+				fp := strings.Split(entry.Name(), ".")[0]
+				if !slices.Contains(images, fp) {
+					err = os.Remove(filepath.Join(imagesDir, entry.Name()))
+					if err != nil {
+						return fmt.Errorf("Unable to remove leftover image: %v: %w", entry.Name(), err)
+					}
+
+					logger.Debugf("Removed leftover image file: %s", entry.Name())
+				}
 			}
 		}
 
@@ -2609,7 +2696,7 @@ func pruneLeftoverImages(s *state.State) {
 		return
 	}
 
-	logger.Infof("Done cleaning up leftover image files")
+	logger.Info("Done cleaning up leftover image files")
 }
 
 func pruneExpiredImages(ctx context.Context, s *state.State, op *operations.Operation) error {
@@ -2674,13 +2761,21 @@ func pruneExpiredImages(ctx context.Context, s *state.State, op *operations.Oper
 		default:
 		}
 
-		dbImagesDeleted := 0
+		deleteAtStorage := make(map[string]bool)
 		for _, dbImage := range dbImages {
+			projectImagesStorageVolume := s.LocalConfig.StorageImagesVolume(dbImage.Project)
+			_, imageSeenInThisStoragePreviously := deleteAtStorage[projectImagesStorageVolume]
+			if !imageSeenInThisStoragePreviously {
+				// First record of image in this project, candidate for deletion.
+				deleteAtStorage[projectImagesStorageVolume] = true
+			}
+
 			// Get expiry days for image's project.
 			expiryDays := projectsImageRemoteCacheExpiryDays[dbImage.Project]
 
 			// Skip if no project expiry time set.
 			if expiryDays <= 0 {
+				deleteAtStorage[projectImagesStorageVolume] = false
 				continue
 			}
 
@@ -2694,6 +2789,7 @@ func pruneExpiredImages(ctx context.Context, s *state.State, op *operations.Oper
 
 			// Skip if image is not expired.
 			if imageExpiry.After(time.Now()) {
+				deleteAtStorage[projectImagesStorageVolume] = false
 				continue
 			}
 
@@ -2705,16 +2801,29 @@ func pruneExpiredImages(ctx context.Context, s *state.State, op *operations.Oper
 				return fmt.Errorf("Error deleting image %q in project %q from database: %w", fingerprint, dbImage.Project, err)
 			}
 
-			dbImagesDeleted++
-
 			logger.Info("Deleted expired cached image record", logger.Ctx{"fingerprint": fingerprint, "project": dbImage.Project, "expiry": imageExpiry})
 
-			s.Events.SendLifecycle(dbImage.Project, lifecycle.ImageDeleted.Event(fingerprint, dbImage.Project, op.Requestor(), nil))
+			s.Events.SendLifecycle(dbImage.Project, lifecycle.ImageDeleted.Event(fingerprint, dbImage.Project, op.EventLifecycleRequestor(), nil))
+		}
+
+		// Remove main image files from projects which don't have any images referenced.
+		deleteStorageVolumes := true
+		for projectImagesVolume, deleteImageFileInProject := range deleteAtStorage {
+			if !deleteImageFileInProject {
+				// Other projects are still using the image at this location.
+				deleteStorageVolumes = false
+				continue
+			}
+
+			err := imageDeleteFromDisk(projectImagesVolume, fingerprint)
+			if err != nil {
+				return err
+			}
 		}
 
 		// Skip deleting the image files and image storage volumes on disk if image is not expired in all
 		// of its projects.
-		if dbImagesDeleted < len(dbImages) {
+		if !deleteStorageVolumes {
 			continue
 		}
 
@@ -2750,12 +2859,6 @@ func pruneExpiredImages(ctx context.Context, s *state.State, op *operations.Oper
 			if err != nil {
 				return fmt.Errorf("Error deleting image volume %q from storage pool %q: %w", fingerprint, pool.Name(), err)
 			}
-		}
-
-		// Remove main image file.
-		err := imageDeleteFromDisk(s, fingerprint)
-		if err != nil {
-			return err
 		}
 
 		logger.Info("Deleted expired cached image files and volumes", logger.Ctx{"fingerprint": fingerprint})
@@ -2798,10 +2901,26 @@ func imageDelete(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
+	op, err := doImageDelete(r.Context(), s, details.image.Fingerprint, details.imageID, projectName)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	return operations.OperationResponse(op)
+}
+
+// doImageDelete deletes an image with the given fingerprint and imageID in the given project.
+func doImageDelete(ctx context.Context, s *state.State, fingerprint string, imageID int, projectName string) (*operations.Operation, error) {
+	requestor, err := request.GetRequestor(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	isClusterNotification := requestor.IsClusterNotification()
 	do := func(op *operations.Operation) error {
 		// Lock this operation to ensure that concurrent image operations don't conflict.
 		// Other operations will wait for this one to finish.
-		unlock, err := imageOperationLock(details.image.Fingerprint)
+		unlock, err := imageOperationLock(fingerprint)
 		if err != nil {
 			return err
 		}
@@ -2813,7 +2932,7 @@ func imageDelete(d *Daemon, r *http.Request) response.Response {
 		err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 			// Check image still exists and another request hasn't removed it since we resolved the image
 			// fingerprint above.
-			exist, err = tx.ImageExists(ctx, projectName, details.image.Fingerprint)
+			exist, err = tx.ImageExists(ctx, projectName, fingerprint)
 
 			return err
 		})
@@ -2825,7 +2944,7 @@ func imageDelete(d *Daemon, r *http.Request) response.Response {
 			return api.StatusErrorf(http.StatusNotFound, "Image not found")
 		}
 
-		if !isClusterNotification(r) {
+		if !isClusterNotification {
 			var referenced bool
 
 			err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -2833,13 +2952,26 @@ func imageDelete(d *Daemon, r *http.Request) response.Response {
 				// referenced by other projects. In that case we don't want to
 				// physically delete it just yet, but just to remove the
 				// relevant database entry.
-				referenced, err = tx.ImageIsReferencedByOtherProjects(ctx, projectName, details.image.Fingerprint)
+				projects, err := tx.ProjectsWithImage(ctx, fingerprint)
 				if err != nil {
 					return err
 				}
 
+				// See if any other project with this image has the same storage volume
+				projectImagesVolume := s.LocalConfig.StorageImagesVolume(projectName)
+				for _, project := range projects {
+					if project == projectName {
+						continue
+					}
+
+					if s.LocalConfig.StorageImagesVolume(project) == projectImagesVolume {
+						referenced = true
+						break
+					}
+				}
+
 				if referenced {
-					err = tx.DeleteImage(ctx, details.imageID)
+					err = tx.DeleteImage(ctx, imageID)
 					if err != nil {
 						return fmt.Errorf("Error deleting image info from the database: %w", err)
 					}
@@ -2862,7 +2994,7 @@ func imageDelete(d *Daemon, r *http.Request) response.Response {
 			}
 
 			err = notifier(func(member db.NodeInfo, client lxd.InstanceServer) error {
-				op, err := client.UseProject(projectName).DeleteImage(details.image.Fingerprint)
+				op, err := client.UseProject(projectName).DeleteImage(fingerprint)
 				if err != nil {
 					return fmt.Errorf("Failed to request to delete image from peer node: %w", err)
 				}
@@ -2884,7 +3016,7 @@ func imageDelete(d *Daemon, r *http.Request) response.Response {
 
 		err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 			// Delete the pool volumes.
-			poolIDs, err = tx.GetPoolsWithImage(ctx, details.image.Fingerprint)
+			poolIDs, err = tx.GetPoolsWithImage(ctx, fingerprint)
 			if err != nil {
 				return err
 			}
@@ -2903,54 +3035,54 @@ func imageDelete(d *Daemon, r *http.Request) response.Response {
 		for _, poolName := range poolNames {
 			pool, err := storagePools.LoadByName(s, poolName)
 			if err != nil {
-				return fmt.Errorf("Error loading storage pool %q to delete image %q: %w", poolName, details.image.Fingerprint, err)
+				return fmt.Errorf("Error loading storage pool %q to delete image %q: %w", poolName, fingerprint, err)
 			}
 
 			// Only perform the deletion of remote volumes on the server handling the request.
-			if !isClusterNotification(r) || !pool.Driver().Info().Remote {
-				err = pool.DeleteImage(details.image.Fingerprint, op)
+			if !isClusterNotification || !pool.Driver().Info().Remote {
+				err = pool.DeleteImage(fingerprint, op)
 				if err != nil {
-					return fmt.Errorf("Error deleting image %q from storage pool %q: %w", details.image.Fingerprint, pool.Name(), err)
+					return fmt.Errorf("Error deleting image %q from storage pool %q: %w", fingerprint, pool.Name(), err)
 				}
 			}
 		}
 
 		// Remove main image file from disk.
-		err = imageDeleteFromDisk(s, details.image.Fingerprint)
+		err = imageDeleteFromDisk(s.LocalConfig.StorageImagesVolume(projectName), fingerprint)
 		if err != nil {
 			return err
 		}
 
 		// Remove the database entry.
-		if !isClusterNotification(r) {
+		if !isClusterNotification {
 			err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-				return tx.DeleteImage(ctx, details.imageID)
+				return tx.DeleteImage(ctx, imageID)
 			})
 			if err != nil {
 				return fmt.Errorf("Error deleting image info from the database: %w", err)
 			}
 		}
 
-		s.Events.SendLifecycle(projectName, lifecycle.ImageDeleted.Event(details.image.Fingerprint, projectName, op.Requestor(), nil))
+		s.Events.SendLifecycle(projectName, lifecycle.ImageDeleted.Event(fingerprint, projectName, op.EventLifecycleRequestor(), nil))
 
 		return nil
 	}
 
 	resources := map[string][]api.URL{}
-	resources["images"] = []api.URL{*api.NewURL().Path(version.APIVersion, "images", details.image.Fingerprint)}
+	resources["images"] = []api.URL{*api.NewURL().Path(version.APIVersion, "images", fingerprint)}
 
-	op, err := operations.OperationCreate(r.Context(), s, projectName, operations.OperationClassTask, operationtype.ImageDelete, resources, nil, do, nil, nil)
+	op, err := operations.OperationCreate(ctx, s, projectName, operations.OperationClassTask, operationtype.ImageDelete, resources, nil, do, nil, nil)
 	if err != nil {
-		return response.InternalError(err)
+		return nil, err
 	}
 
-	return operations.OperationResponse(op)
+	return op, nil
 }
 
 // imageDeleteFromDisk removes the main image file and rootfs file of an image.
-func imageDeleteFromDisk(s *state.State, fingerprint string) error {
+func imageDeleteFromDisk(daemonStorageVolume string, fingerprint string) error {
 	// Remove main image file.
-	fname := filepath.Join(s.ImagesStoragePath(), fingerprint)
+	fname := filepath.Join(daemonStoragePath(daemonStorageVolume, config.DaemonStorageTypeImages), fingerprint)
 	if shared.PathExists(fname) {
 		err := os.Remove(fname)
 		if err != nil && !os.IsNotExist(err) {
@@ -3129,12 +3261,22 @@ func imageGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
+	err = validateImageFingerprintPrefix(fingerprint)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	withEntitlements, err := extractEntitlementsFromQuery(r, entity.TypeImage, false)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	trusted := auth.IsTrusted(r.Context())
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	trusted := requestor.IsTrusted()
 	secret := r.FormValue("secret")
 
 	// Unauthenticated clients that do not provide a secret may only view public images.
@@ -3188,9 +3330,7 @@ func imageGet(d *Daemon, r *http.Request) response.Response {
 			userCanViewImage = true
 		} else {
 			// Otherwise perform an access check with the full image fingerprint.
-			reqInfo := request.SetupContextInfo(r)
-			reqInfo.EffectiveProjectName = effectiveProjectName
-
+			request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
 			err = s.Authorizer.CheckPermission(r.Context(), entity.ImageURL(projectName, info.Fingerprint), auth.EntitlementCanView)
 			if err != nil && !auth.IsDeniedError(err) {
 				return response.SmartError(err)
@@ -3206,7 +3346,7 @@ func imageGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	if len(withEntitlements) > 0 {
-		err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeImage, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.ImageURL(projectName, fingerprint): info})
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeImage, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.ImageURL(projectName, fingerprint): info})
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -3616,9 +3756,7 @@ func imageAliasesGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	reqInfo := request.SetupContextInfo(r)
-	reqInfo.EffectiveProjectName = effectiveProjectName
-
+	request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
 	userHasPermission, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeImageAlias)
 	if err != nil {
 		return response.InternalError(fmt.Errorf("Failed to get a permission checker: %w", err))
@@ -3668,7 +3806,7 @@ func imageAliasesGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	if len(withEntitlements) > 0 {
-		err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeImageAlias, withEntitlements, urlToImageAlias)
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeImageAlias, withEntitlements, urlToImageAlias)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -3782,10 +3920,7 @@ func imageAliasGet(d *Daemon, r *http.Request) response.Response {
 	// Set `userCanViewImageAlias` to true only when the caller is authenticated and can view the alias.
 	// We don't abort the request if this is false because the image alias may be for a public image.
 	var userCanViewImageAlias bool
-
-	reqInfo := request.SetupContextInfo(r)
-	reqInfo.EffectiveProjectName = effectiveProjectName
-
+	request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
 	err = s.Authorizer.CheckPermission(r.Context(), entity.ImageAliasURL(projectName, name), auth.EntitlementCanView)
 	if err != nil && !auth.IsDeniedError(err) {
 		return response.SmartError(err)
@@ -3808,7 +3943,7 @@ func imageAliasGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	if len(withEntitlements) > 0 {
-		err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeImageAlias, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.ImageAliasURL(projectName, name): &alias})
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeImageAlias, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.ImageAliasURL(projectName, name): &alias})
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -4209,16 +4344,24 @@ func imageExport(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	// Verify the auth method in the request context to determine if the request comes from the /dev/lxd socket.
-	authMethod, _ := auth.GetAuthenticationMethodFromCtx(r.Context())
-	isDevLXDQuery := authMethod == auth.AuthenticationMethodDevLXD
+	err = validateImageFingerprintPrefix(fingerprint)
+	if err != nil {
+		return response.SmartError(err)
+	}
 
+	// Verify the auth method in the request context to determine if the request comes from the /dev/lxd socket.
 	secret := r.FormValue("secret")
-	trusted := auth.IsTrusted(r.Context())
+
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	trusted := requestor.IsTrusted()
 
 	// Unauthenticated remote clients that do not provide a secret may only view public images.
 	// For devlxd, we allow querying for private images. We'll subsequently perform additional access checks.
-	publicOnly := !trusted && secret == "" && !isDevLXDQuery
+	publicOnly := !trusted && secret == ""
 
 	// Get the image. We need to do this before the permission check because the URL in the permission check will not
 	// work with partial fingerprints.
@@ -4262,29 +4405,13 @@ func imageExport(d *Daemon, r *http.Request) response.Response {
 		}
 	}
 
-	if isDevLXDQuery {
-		// A devlxd query must contain the full fingerprint of the image (no partials).
-		if fingerprint != imgInfo.Fingerprint {
-			return response.NotFound(nil)
-		}
-
-		// A devlxd query must be for a public or cached image.
-		if !imgInfo.Public && !imgInfo.Cached {
-			return response.NotFound(nil)
-		}
-
-		userCanViewImage = true
-	}
-
 	if !userCanViewImage {
 		if imgInfo.Public {
 			// If the image is public any client can view it.
 			userCanViewImage = true
 		} else {
 			// Otherwise perform an access check with the full image fingerprint.
-			reqInfo := request.SetupContextInfo(r)
-			reqInfo.EffectiveProjectName = effectiveProjectName
-
+			request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
 			err = s.Authorizer.CheckPermission(r.Context(), entity.ImageURL(projectName, imgInfo.Fingerprint), auth.EntitlementCanView)
 			if err != nil && !auth.IsDeniedError(err) {
 				return response.SmartError(err)
@@ -4299,12 +4426,16 @@ func imageExport(d *Daemon, r *http.Request) response.Response {
 		return response.NotFound(nil)
 	}
 
+	return imageExportFiles(r.Context(), s, imgInfo, projectName)
+}
+
+// imageExportFiles returns the [response.FileResponse] for the specified image files, the image can be local or remote.
+func imageExportFiles(ctx context.Context, s *state.State, imgInfo *api.Image, requestProjectName string) response.Response {
 	var address string
-
-	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		// Check if the image is only available on another node.
+		var err error
 		address, err = tx.LocateImage(ctx, imgInfo.Fingerprint)
-
 		return err
 	})
 	if err != nil {
@@ -4313,7 +4444,7 @@ func imageExport(d *Daemon, r *http.Request) response.Response {
 
 	if address != "" {
 		// Forward the request to the other node
-		client, err := cluster.Connect(r.Context(), address, s.Endpoints.NetworkCert(), s.ServerCert(), false)
+		client, err := cluster.Connect(ctx, address, s.Endpoints.NetworkCert(), s.ServerCert(), false)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -4321,7 +4452,7 @@ func imageExport(d *Daemon, r *http.Request) response.Response {
 		return response.ForwardedResponse(client)
 	}
 
-	imagePath := filepath.Join(s.ImagesStoragePath(), imgInfo.Fingerprint)
+	imagePath := filepath.Join(s.ImagesStoragePath(requestProjectName), imgInfo.Fingerprint)
 	rootfsPath := imagePath + ".rootfs"
 
 	_, ext, _, err := shared.DetectCompression(imagePath)
@@ -4356,8 +4487,8 @@ func imageExport(d *Daemon, r *http.Request) response.Response {
 		files[1].Path = rootfsPath
 		files[1].Filename = filename
 
-		requestor := request.CreateRequestor(r.Context())
-		s.Events.SendLifecycle(projectName, lifecycle.ImageRetrieved.Event(imgInfo.Fingerprint, projectName, requestor, nil))
+		requestor := request.CreateRequestor(ctx)
+		s.Events.SendLifecycle(requestProjectName, lifecycle.ImageRetrieved.Event(imgInfo.Fingerprint, requestProjectName, requestor, nil))
 
 		return response.FileResponse(files, nil)
 	}
@@ -4367,8 +4498,8 @@ func imageExport(d *Daemon, r *http.Request) response.Response {
 	files[0].Path = imagePath
 	files[0].Filename = filename
 
-	requestor := request.CreateRequestor(r.Context())
-	s.Events.SendLifecycle(projectName, lifecycle.ImageRetrieved.Event(imgInfo.Fingerprint, projectName, requestor, nil))
+	requestor := request.CreateRequestor(ctx)
+	s.Events.SendLifecycle(requestProjectName, lifecycle.ImageRetrieved.Event(imgInfo.Fingerprint, requestProjectName, requestor, nil))
 
 	return response.FileResponse(files, nil)
 }
@@ -4436,7 +4567,7 @@ func imageExportPost(d *Daemon, r *http.Request) response.Response {
 
 	run := func(op *operations.Operation) error {
 		createArgs := &lxd.ImageCreateArgs{}
-		imageMetaPath := filepath.Join(s.ImagesStoragePath(), details.imageFingerprintPrefix)
+		imageMetaPath := filepath.Join(s.ImagesStoragePath(projectName), details.imageFingerprintPrefix)
 		imageRootfsPath := imageMetaPath + ".rootfs"
 
 		metaFile, err := os.Open(imageMetaPath)
@@ -4503,7 +4634,7 @@ func imageExportPost(d *Daemon, r *http.Request) response.Response {
 			return fmt.Errorf("Failed operation %q: %q", opWaitAPI.Status, opWaitAPI.Err)
 		}
 
-		s.Events.SendLifecycle(projectName, lifecycle.ImageRetrieved.Event(details.imageFingerprintPrefix, projectName, op.Requestor(), logger.Ctx{"target": req.Target}))
+		s.Events.SendLifecycle(projectName, lifecycle.ImageRetrieved.Event(details.imageFingerprintPrefix, projectName, op.EventLifecycleRequestor(), logger.Ctx{"target": req.Target}))
 
 		return nil
 	}
@@ -4951,7 +5082,7 @@ func createTokenResponse(s *state.State, r *http.Request, projectName string, fi
 		return response.InternalError(err)
 	}
 
-	s.Events.SendLifecycle(projectName, lifecycle.ImageSecretCreated.Event(fingerprint, projectName, op.Requestor(), nil))
+	s.Events.SendLifecycle(projectName, lifecycle.ImageSecretCreated.Event(fingerprint, projectName, op.EventLifecycleRequestor(), nil))
 
 	return operations.OperationResponse(op)
 }

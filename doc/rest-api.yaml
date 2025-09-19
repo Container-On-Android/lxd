@@ -747,6 +747,30 @@ definitions:
                 x-go-name: Type
         type: object
         x-go-package: github.com/canonical/lxd/shared/api
+    IdentitiesBearerPost:
+        properties:
+            groups:
+                description: Groups is the list of groups for which the identity is a member.
+                example:
+                    - foo
+                    - bar
+                items:
+                    type: string
+                type: array
+                x-go-name: Groups
+            name:
+                description: Name associated with the identity
+                example: foo
+                type: string
+                x-go-name: Name
+            type:
+                description: Type of identity
+                example: DevLXD token bearer
+                type: string
+                x-go-name: Type
+        title: IdentitiesBearerPost contains required information for the creation of a token identity.
+        type: object
+        x-go-package: github.com/canonical/lxd/shared/api
     IdentitiesTLSPost:
         properties:
             certificate:
@@ -832,6 +856,24 @@ definitions:
                 type: string
                 x-go-name: Type
         title: Identity is the type for an authenticated party that can make requests to the HTTPS API.
+        type: object
+        x-go-package: github.com/canonical/lxd/shared/api
+    IdentityBearerToken:
+        description: |-
+            IdentityBearerToken contains a token issued for an identity whose authentication method is
+            api.AuthenticationMethodBearer.
+        properties:
+            token:
+                type: string
+                x-go-name: Token
+        type: object
+        x-go-package: github.com/canonical/lxd/shared/api
+    IdentityBearerTokenPost:
+        properties:
+            expiry:
+                type: string
+                x-go-name: Expiry
+        title: IdentityBearerTokenPost contains parameters used when issuing a token for a bearer identity.
         type: object
         x-go-package: github.com/canonical/lxd/shared/api
     IdentityInfo:
@@ -2220,7 +2262,6 @@ definitions:
                     type: string
                 description: Migration websockets credentials
                 example:
-                    criu: random-string
                     migration: random-string
                 type: object
                 x-go-name: Websockets
@@ -4307,6 +4348,8 @@ definitions:
                     interactive: true
                 type: object
                 x-go-name: Metadata
+            requestor:
+                $ref: '#/definitions/OperationRequestor'
             resources:
                 additionalProperties:
                     items:
@@ -4333,6 +4376,27 @@ definitions:
                 format: date-time
                 type: string
                 x-go-name: UpdatedAt
+        type: object
+        x-go-package: github.com/canonical/lxd/shared/api
+    OperationRequestor:
+        description: 'API extension: operation_requestor.'
+        properties:
+            address:
+                description: Address is the origin address of the request.
+                example: 10.0.2.15
+                type: string
+                x-go-name: Address
+            protocol:
+                description: Protocol represents the method used to authenticate the requestor.
+                example: oidc
+                type: string
+                x-go-name: Protocol
+            username:
+                description: Username is the username of the requestor. This is the identifier of the identity, or the username if using the unix socket.
+                example: jane.doe@example.com
+                type: string
+                x-go-name: Username
+        title: OperationRequestor represents the initial requestor of an operation
         type: object
         x-go-package: github.com/canonical/lxd/shared/api
     Permission:
@@ -5604,6 +5668,11 @@ definitions:
                 example: "3:5"
                 type: string
                 x-go-name: USBAddress
+            used_by:
+                description: Parent device type
+                example: bcache
+                type: string
+                x-go-name: UsedBy
             wwn:
                 description: WWN identifier
                 example: eui.0000000001000000e4d25cafae2e4c00
@@ -6004,9 +6073,9 @@ definitions:
                 x-go-name: ClientCertificate
             config:
                 additionalProperties: {}
-                description: Server configuration map (refer to doc/server.md)
+                description: Server configuration map (refer to doc/server.md) The available fields for public endpoint (before authentication) are limited.
                 example:
-                    core.https_address: :8443
+                    user.microcloud: "true"
                 type: object
                 x-go-name: Config
             environment:
@@ -6266,6 +6335,13 @@ definitions:
                 readOnly: true
                 type: boolean
                 x-go-name: ClientCertificate
+            config:
+                additionalProperties: {}
+                description: Server configuration map (refer to doc/server.md) The available fields for public endpoint (before authentication) are limited.
+                example:
+                    user.microcloud: "true"
+                type: object
+                x-go-name: Config
             public:
                 description: Whether the server is public-only (only public endpoints are implemented)
                 example: false
@@ -7553,6 +7629,51 @@ paths:
                 "500":
                     $ref: '#/responses/InternalServerError'
             summary: Get the identities
+            tags:
+                - identities
+    /1.0/auth/identities/bearer:
+        post:
+            consumes:
+                - application/json
+            description: Creates a new bearer identity.
+            operationId: identities_post_bearer
+            parameters:
+                - description: Bearer Identity
+                  in: body
+                  name: Bearer identity
+                  required: true
+                  schema:
+                    $ref: '#/definitions/IdentitiesBearerPost'
+            produces:
+                - application/json
+            responses:
+                "201":
+                    $ref: '#/responses/EmptySyncResponse'
+                "400":
+                    $ref: '#/responses/BadRequest'
+                "403":
+                    $ref: '#/responses/Forbidden'
+                "500":
+                    $ref: '#/responses/InternalServerError'
+            summary: Add a bearer identity.
+            tags:
+                - identities
+    /1.0/auth/identities/bearer/{nameOrID}/token:
+        post:
+            consumes:
+                - application/json
+            description: Revokes any existing token for the identity.
+            operationId: identity_delete_bearer_token
+            produces:
+                - application/json
+            responses:
+                "403":
+                    $ref: '#/responses/Forbidden'
+                "404":
+                    $ref: '#/responses/NotFound'
+                "500":
+                    $ref: '#/responses/InternalServerError'
+            summary: Revoke a bearer identity token.
             tags:
                 - identities
     /1.0/auth/identities/current:
@@ -9365,6 +9486,8 @@ paths:
         post:
             consumes:
                 - application/json
+                - application/octet-stream
+                - multipart/form-data
             description: Adds a new image to the image store.
             operationId: images_post
             parameters:
@@ -10317,6 +10440,7 @@ paths:
         post:
             consumes:
                 - application/json
+                - application/octet-stream
             description: |-
                 Creates a new instance on LXD.
                 Depending on the source, this can create an instance from an existing
@@ -16085,6 +16209,7 @@ paths:
         post:
             consumes:
                 - application/json
+                - application/octet-stream
             description: |-
                 Creates a new storage volume (type specific endpoint).
                 Will return an empty sync response on simple volume creation but an operation on copy or migration.

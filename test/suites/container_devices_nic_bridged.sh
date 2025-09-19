@@ -5,7 +5,6 @@ test_container_devices_nic_bridged() {
   fi
 
   ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   firewallDriver=$(lxc info | awk -F ":" '/firewall:/{gsub(/ /, "", $0); print $2}')
 
@@ -36,7 +35,7 @@ test_container_devices_nic_bridged() {
   lxc network set "${brName}" ipv6.address 2001:db8::1/64
   lxc network set "${brName}" ipv4.routes 192.0.3.0/24
   lxc network set "${brName}" ipv6.routes 2001:db8::/64
-  [ "$(cat "/sys/class/net/${brName}/address")" = "00:11:22:33:44:55" ]
+  [ "$(< "/sys/class/net/${brName}/address")" = "00:11:22:33:44:55" ]
 
   # Record how many nics we started with.
   startNicCount=$(find /sys/class/net | wc -l)
@@ -123,42 +122,42 @@ test_container_devices_nic_bridged() {
   fi
 
   # Check profile custom MTU is applied in container on boot.
-  if ! lxc exec "${ctName}" -- grep -xF "1400" /sys/class/net/eth0/mtu ; then
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/mtu)" != "1400" ]; then
     echo "container veth mtu invalid"
     false
   fi
 
   # Check profile custom MTU doesn't affect the host.
-  if ! grep -xF "1500" /sys/class/net/"${vethHostName}"/mtu ; then
+  if [ "$(< /sys/class/net/"${vethHostName}"/mtu)" != "1500" ]; then
     echo "host veth mtu invalid"
     false
   fi
 
   # Check profile custom txqueuelen is applied in container on boot.
-  if ! lxc exec "${ctName}" -- grep -xF "1200" /sys/class/net/eth0/tx_queue_len ; then
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/tx_queue_len)" != "1200" ]; then
     echo "container veth txqueuelen invalid"
     false
   fi
 
   # Check profile custom txqueuelen is applied on host side of veth.
-  if ! grep -xF "1200" /sys/class/net/"${vethHostName}"/tx_queue_len ; then
+  if [ "$(< /sys/class/net/"${vethHostName}"/tx_queue_len)" != "1200" ]; then
     echo "host veth txqueuelen invalid"
     false
   fi
 
   # Check profile custom MAC is applied in container on boot.
-  if ! lxc exec "${ctName}" -- grep -Fix "${ctMAC}" /sys/class/net/eth0/address ; then
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/address)" != "${ctMAC}" ]; then
     echo "mac invalid"
     false
   fi
 
   # Add IP alias to container and check routes actually work.
+  lxc exec "${ctName}" -- ip -6 addr add "2001:db8::1${ipRand}/128" dev eth0
   lxc exec "${ctName}" -- ip -4 addr add "192.0.2.1${ipRand}/32" dev eth0
   lxc exec "${ctName}" -- ip -4 route add default dev eth0
-  ping -c2 -W5 "192.0.2.1${ipRand}"
-  lxc exec "${ctName}" -- ip -6 addr add "2001:db8::1${ipRand}/128" dev eth0
+  ping -nc2 -i0.1 -W1 "192.0.2.1${ipRand}"
   wait_for_dad "${ctName}" eth0
-  ping6 -c2 -W5 "2001:db8::1${ipRand}"
+  ping -6 -nc2 -i0.1 -W1 "2001:db8::1${ipRand}"
 
   # Test hot plugging a container nic with different settings to profile with the same name.
   lxc config device add "${ctName}" eth0 nic \
@@ -217,19 +216,19 @@ test_container_devices_nic_bridged() {
   fi
 
   # Check custom MTU is applied on hot-plug.
-  if ! lxc exec "${ctName}" -- grep -xF "1401" /sys/class/net/eth0/mtu ; then
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/mtu)" != "1401" ]; then
     echo "container veth mtu invalid"
     false
   fi
 
   # Check custom MTU doesn't affect the host.
-  if ! grep -xF "1500" /sys/class/net/"${vethHostName}"/mtu ; then
+  if [ "$(< /sys/class/net/"${vethHostName}"/mtu)" != "1500" ]; then
     echo "host veth mtu invalid"
     false
   fi
 
   # Check custom MAC is applied on hot-plug.
-  if ! lxc exec "${ctName}" -- grep -Fix "${ctMAC}" /sys/class/net/eth0/address ; then
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/address)" != "${ctMAC}" ]; then
     echo "mac invalid"
     false
   fi
@@ -277,13 +276,13 @@ test_container_devices_nic_bridged() {
   fi
 
   # Check profile custom MTU is applied on hot-removal.
-  if ! lxc exec "${ctName}" -- grep -xF "1400" /sys/class/net/eth0/mtu ; then
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/mtu)" != "1400" ]; then
     echo "container veth mtu invalid"
     false
   fi
 
   # Check custom MTU doesn't affect the host.
-  if ! grep -xF "1500" /sys/class/net/"${vethHostName}"/mtu ; then
+  if [ "$(< /sys/class/net/"${vethHostName}"/mtu)" != "1500" ]; then
     echo "host veth mtu invalid"
     false
   fi
@@ -369,13 +368,13 @@ test_container_devices_nic_bridged() {
   fi
 
   # Check custom MTU is applied update.
-  if ! lxc exec "${ctName}" -- grep -xF "1402" /sys/class/net/eth0/mtu ; then
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/mtu)" != "1402" ]; then
     echo "mtu invalid"
     false
   fi
 
   # Check custom MAC is applied update.
-  if ! lxc exec "${ctName}" -- grep -Fix "${ctMAC}" /sys/class/net/eth0/address ; then
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/address)" != "${ctMAC}" ]; then
     echo "mac invalid"
     false
   fi
@@ -385,7 +384,7 @@ test_container_devices_nic_bridged() {
   lxc config device unset "${ctName}" eth0 mtu
   lxc network set "${brName}" bridge.mtu "1405"
   lxc start "${ctName}"
-  if ! lxc exec "${ctName}" -- grep -xF "1405" /sys/class/net/eth0/mtu ; then
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/mtu)" != "1405" ]; then
     echo "mtu not inherited from parent"
     false
   fi
@@ -470,15 +469,10 @@ test_container_devices_nic_bridged() {
   ip netns exec testdns ip link set veth_right name eth0
   ip netns exec testdns ip link set dev eth0 up
   ip netns exec testdns ip addr add 192.0.2.20/24 dev eth0
-  ip netns exec testdns ip addr add 2001:db8::20/64 dev eth0
+  ip netns exec testdns ip addr add 2001:db8::20/64 dev eth0 nodad
 
   ip addr
   ip netns exec testdns ip addr
-
-  # Give eth0 a chance to finish duplicate addr detection (ipv6)
-  while ip netns exec testdns ip a | grep "tentative"; do
-    sleep 0.5
-  done
 
   ip netns exec testdns dig -4 +retry=0 +notcp @192.0.2.1 A "${ctName}.${dnsDomain}" | grep "${ctName}.${dnsDomain}.\\+0.\\+IN.\\+A.\\+192.0.2."
   ip netns exec testdns dig -6 +retry=0 +notcp @2001:db8::1 A "${ctName}.${dnsDomain}" | grep "${ctName}.${dnsDomain}.\\+0.\\+IN.\\+A.\\+192.0.2."
@@ -516,10 +510,10 @@ test_container_devices_nic_bridged() {
   ip addr
   ip netns exec testdns ip addr
 
-  ! ip netns exec testdns dig -4 +retry=0 +notcp @192.0.2.1 A "${ctName}.${dnsDomain}" | grep "${ctName}.${dnsDomain}.\\+0.\\+IN.\\+A.\\+192.0.2."
-  ! ip netns exec testdns dig -6 +retry=0 +notcp @2001:db8::1 A "${ctName}.${dnsDomain}" | grep "${ctName}.${dnsDomain}.\\+0.\\+IN.\\+A.\\+192.0.2."
-  ! ip netns exec testdns dig -4 +retry=0 +tcp @192.0.2.1 A "${ctName}.${dnsDomain}" | grep "${ctName}.${dnsDomain}.\\+0.\\+IN.\\+A.\\+192.0.2."
-  ! ip netns exec testdns dig -6 +retry=0 +tcp @2001:db8::1 A "${ctName}.${dnsDomain}" | grep "${ctName}.${dnsDomain}.\\+0.\\+IN.\\+A.\\+192.0.2."
+  ! ip netns exec testdns dig -4 +retry=0 +notcp @192.0.2.1 A "${ctName}.${dnsDomain}" | grep "${ctName}.${dnsDomain}.\\+0.\\+IN.\\+A.\\+192.0.2." || false
+  ! ip netns exec testdns dig -6 +retry=0 +notcp @2001:db8::1 A "${ctName}.${dnsDomain}" | grep "${ctName}.${dnsDomain}.\\+0.\\+IN.\\+A.\\+192.0.2." || false
+  ! ip netns exec testdns dig -4 +retry=0 +tcp @192.0.2.1 A "${ctName}.${dnsDomain}" | grep "${ctName}.${dnsDomain}.\\+0.\\+IN.\\+A.\\+192.0.2." || false
+  ! ip netns exec testdns dig -6 +retry=0 +tcp @2001:db8::1 A "${ctName}.${dnsDomain}" | grep "${ctName}.${dnsDomain}.\\+0.\\+IN.\\+A.\\+192.0.2." || false
 
   ip netns exec testdns ip link delete eth0
   ip netns delete testdns
@@ -585,7 +579,7 @@ test_container_devices_nic_bridged() {
   lxc network set "${brName}" ipv6.address none
 
   # Confirm IPv6 is disabled.
-  [ "$(cat "/proc/sys/net/ipv6/conf/${brName}/disable_ipv6")" = "1" ]
+  [ "$(< "/proc/sys/net/ipv6/conf/${brName}/disable_ipv6")" = "1" ]
 
   if [ -f "${LXD_DIR}/networks/${brName}/dnsmasq.leases" ] ; then
     echo "dnsmasq.leases file still present after disabling DHCP"
@@ -611,7 +605,7 @@ test_container_devices_nic_bridged() {
   lxc profile device set "${ctName}" eth0 ipv6.routes "2001:db8::1${ipRand}/128"
 
   # Confirm IPv6 is re-enabled.
-  [ "$(cat "/proc/sys/net/ipv6/conf/${brName}/disable_ipv6")" = "0" ]
+  [ "$(< "/proc/sys/net/ipv6/conf/${brName}/disable_ipv6")" = "0" ]
 
   # Check dnsmasq host file is created on add.
   lxc config device add "${ctName}" eth0 nic nictype=bridged parent="${brName}" name=eth0
@@ -632,29 +626,29 @@ test_container_devices_nic_bridged() {
 
   # Linked network tests.
   # Can't use network property when parent is set.
-  ! lxc profile device set "${ctName}" eth0 network="${brName}"
+  ! lxc profile device set "${ctName}" eth0 network="${brName}" || false
 
   # Remove mtu, nictype and parent settings and assign network in one command.
   lxc profile device set "${ctName}" eth0 mtu="" parent="" nictype="" network="${brName}"
 
   # Can't remove network if parent not specified.
-  ! lxc profile device unset "${ctName}" eth0 network
+  ! lxc profile device unset "${ctName}" eth0 network || false
 
   # Can't use some settings when network is set.
-  ! lxc profile device set "${ctName}" eth0 nictype="bridged"
-  ! lxc profile device set "${ctName}" eth0 mtu="1400"
-  ! lxc profile device set "${ctName}" eth0 maas.subnet.ipv4="test"
-  ! lxc profile device set "${ctName}" eth0 maas.subnet.ipv6="test"
+  ! lxc profile device set "${ctName}" eth0 nictype="bridged" || false
+  ! lxc profile device set "${ctName}" eth0 mtu="1400" || false
+  ! lxc profile device set "${ctName}" eth0 maas.subnet.ipv4="test" || false
+  ! lxc profile device set "${ctName}" eth0 maas.subnet.ipv6="test" || false
 
   # Can't set static IP that isn't part of network's subnet.
-  ! lxc profile device set "${ctName}" eth0 ipv4.address="192.0.4.2"
-  ! lxc profile device set "${ctName}" eth0 ipv6.address="2001:db8:2::2"
+  ! lxc profile device set "${ctName}" eth0 ipv4.address="192.0.4.2" || false
+  ! lxc profile device set "${ctName}" eth0 ipv6.address="2001:db8:2::2" || false
 
   # Test bridge MTU is inherited.
   lxc network set "${brName}" bridge.mtu 1400
   lxc config device remove "${ctName}" eth0
   lxc start "${ctName}"
-  if ! lxc exec "${ctName}" -- grep -xF "1400" /sys/class/net/eth0/mtu ; then
+  if [ "$(lxc exec "${ctName}" -- cat /sys/class/net/eth0/mtu)" != "1400" ]; then
     echo "container mtu has not been inherited from network"
     false
   fi
@@ -673,21 +667,21 @@ test_container_devices_nic_bridged() {
   lxc network unset "${brName}" bridge.mtu
 
   # Test stateful DHCP static IP checks.
-  ! lxc config device override "${ctName}" eth0 ipv4.address="192.0.4.2"
+  ! lxc config device override "${ctName}" eth0 ipv4.address="192.0.4.2" || false
 
   lxc network set "${brName}" ipv4.dhcp false
-  ! lxc config device override "${ctName}" eth0 ipv4.address="192.0.2.2"
+  ! lxc config device override "${ctName}" eth0 ipv4.address="192.0.2.2" || false
   lxc network unset "${brName}" ipv4.dhcp
   lxc config device override "${ctName}" eth0 ipv4.address="192.0.2.2"
 
-  ! lxc config device set "${ctName}" eth0 ipv6.address="2001:db8:2::2"
+  ! lxc config device set "${ctName}" eth0 ipv6.address="2001:db8:2::2" || false
 
   lxc network set "${brName}" ipv6.dhcp=false ipv6.dhcp.stateful=false
-  ! lxc config device set "${ctName}" eth0 ipv6.address="2001:db8::2"
+  ! lxc config device set "${ctName}" eth0 ipv6.address="2001:db8::2" || false
   lxc network set "${brName}" ipv6.dhcp=true ipv6.dhcp.stateful=false
-  ! lxc config device set "${ctName}" eth0 ipv6.address="2001:db8::2"
+  ! lxc config device set "${ctName}" eth0 ipv6.address="2001:db8::2" || false
   lxc network set "${brName}" ipv6.dhcp=false ipv6.dhcp.stateful=true
-  ! lxc config device set "${ctName}" eth0 ipv6.address="2001:db8::2"
+  ! lxc config device set "${ctName}" eth0 ipv6.address="2001:db8::2" || false
 
   lxc network unset "${brName}" ipv6.dhcp
   lxc config device set "${ctName}" eth0 ipv6.address="2001:db8::2"
@@ -822,11 +816,16 @@ test_container_devices_nic_bridged() {
   lxc import foo.tar.gz foo2
   rm foo.tar.gz
   lxc profile assign foo2 "${ctName}"
+  lxc snapshot foo snap0
 
   # Test container start will fail due to volatile MAC conflict.
   [ "$(lxc config get foo volatile.eth0.hwaddr)" = "$(lxc config get foo2 volatile.eth0.hwaddr)" ]
   ! lxc start foo2 || false
-  lxc delete -f foo foo2
+  lxc delete -f foo2
+
+  # Test snapshot can be copied to remote.
+  lxc copy foo/snap0 localhost:foo3
+  lxc delete -f foo foo3
 
   # Check we haven't left any NICS lying around.
   endNicCount=$(find /sys/class/net | wc -l)

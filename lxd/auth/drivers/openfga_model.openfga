@@ -106,8 +106,7 @@ type server
     # Grants permission to delete storage pools.
     define can_delete_storage_pools: [identity, service_account, group#member] or storage_pool_manager or admin
 
-    # Grants permission to view, create, edit, and delete projects, and to create, edit, and delete any resources
-    # that are owned by those projects.
+    # Grants permission to create, view, edit, and delete projects, and to create, view, edit, and delete resources belonging to any project.
     define project_manager: [identity, service_account, group#member]
 
     # Grants permission to create projects.
@@ -125,8 +124,11 @@ type server
     # If a project is configured with `restricted.cluster.target`, clients with this permission can override the restriction.
     define can_override_cluster_target_restriction: [identity, service_account, group#member] or admin
 
-    # Grants permission to view privileged event types, such as logging events.
-    define can_view_privileged_events: [identity, service_account, group#member] or admin or viewer
+    # Grants permission to view `logging` events, `ovn` events, and all `lifecycle` events that are not specific to a project.
+    define can_view_events: [identity, service_account, group#member] or admin or viewer
+
+    # Grants permission to view operations that are not specific to a project.
+    define can_view_operations: [identity, service_account, group#member] or admin or viewer
 
     # Grants permission to view server and storage pool resource usage information.
     define can_view_resources: [identity, service_account, group#member] or admin or viewer
@@ -321,7 +323,7 @@ type project
     # Grants permission to view operations relating to the project.
     define can_view_operations: [identity, service_account, group#member] or operator or viewer or can_view_projects from server
 
-    # Grants permission to view events relating to the project.
+    # Grants permission to view life cycle events relating to the project.
     define can_view_events: [identity, service_account, group#member] or operator or viewer or can_view_projects from server
 
     # Grants permission to view project level metrics.
@@ -484,7 +486,7 @@ type storage_volume_backup
     define can_view: can_view from storage_volume
     define can_edit: can_manage_backups from storage_volume
     define can_delete: can_manage_backups from storage_volume
-        
+
 type storage_bucket
   relations
     define project: [project]

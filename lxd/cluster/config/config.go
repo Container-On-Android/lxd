@@ -15,15 +15,13 @@ import (
 
 	"github.com/canonical/lxd/lxd/config"
 	"github.com/canonical/lxd/lxd/db"
-	scriptletLoad "github.com/canonical/lxd/lxd/scriptlet/load"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/validate"
 )
 
 // Config holds cluster-wide configuration values.
 type Config struct {
-	tx *db.ClusterTx // DB transaction the values in this config are bound to.
-	m  config.Map    // Low-level map holding the config values.
+	m config.Map // Low-level map holding the config values.
 }
 
 // Load loads a new Config object with the current cluster configuration
@@ -40,7 +38,12 @@ func Load(ctx context.Context, tx *db.ClusterTx) (*Config, error) {
 		return nil, fmt.Errorf("failed to load node config: %w", err)
 	}
 
-	return &Config{tx: tx, m: m}, nil
+	return &Config{m: m}, nil
+}
+
+// ClusterUUID returns the static cluster UUID.
+func (c *Config) ClusterUUID() string {
+	return c.m.GetString("volatile.uuid")
 }
 
 // BackupsCompressionAlgorithm returns the compression algorithm to use for backups.
@@ -188,11 +191,6 @@ func (c *Config) InstancesNICHostname() string {
 	return c.m.GetString("instances.nic.host_name")
 }
 
-// InstancesPlacementScriptlet returns the instances placement scriptlet source code.
-func (c *Config) InstancesPlacementScriptlet() string {
-	return c.m.GetString("instances.placement.scriptlet")
-}
-
 // InstancesMigrationStateful returns the whether or not to auto enable migration.stateful for all VM instances.
 func (c *Config) InstancesMigrationStateful() bool {
 	return c.m.GetBool("instances.migration.stateful")
@@ -226,6 +224,11 @@ func (c *Config) RemoteTokenExpiry() string {
 	return c.m.GetString("core.remote_token_expiry")
 }
 
+// AuthSecretExpiry returns the time after which an core secret is invalid.
+func (c *Config) AuthSecretExpiry() string {
+	return c.m.GetString("core.auth_secret_expiry")
+}
+
 // OIDCServer returns all the OpenID Connect settings needed to connect to a server.
 func (c *Config) OIDCServer() (issuer string, clientID string, clientSecret string, scopes []string, audience string, groupsClaim string) {
 	return c.m.GetString("oidc.issuer"), c.m.GetString("oidc.client.id"), c.m.GetString("oidc.client.secret"), strings.Fields(c.m.GetString("oidc.scopes")), c.m.GetString("oidc.audience"), c.m.GetString("oidc.groups.claim")
@@ -253,34 +256,34 @@ func (c *Config) ClusterHealingThreshold() time.Duration {
 
 // Dump current configuration keys and their values. Keys with values matching
 // their defaults are omitted.
-func (c *Config) Dump() map[string]any {
+func (c *Config) Dump() map[string]string {
 	return c.m.Dump()
 }
 
 // Replace the current configuration with the given values.
 //
 // Return what has actually changed.
-func (c *Config) Replace(values map[string]any) (map[string]string, error) {
-	return c.update(values)
+func (c *Config) Replace(tx *db.ClusterTx, values map[string]string) (map[string]string, error) {
+	return c.update(tx, values)
 }
 
 // Patch changes only the configuration keys in the given map.
 //
 // Return what has actually changed.
-func (c *Config) Patch(patch map[string]any) (map[string]string, error) {
+func (c *Config) Patch(tx *db.ClusterTx, patch map[string]string) (map[string]string, error) {
 	values := c.Dump() // Use current values as defaults
 	maps.Copy(values, patch)
 
-	return c.update(values)
+	return c.update(tx, values)
 }
 
-func (c *Config) update(values map[string]any) (map[string]string, error) {
+func (c *Config) update(tx *db.ClusterTx, values map[string]string) (map[string]string, error) {
 	changed, err := c.m.Change(values)
 	if err != nil {
 		return nil, err
 	}
 
-	err = c.tx.UpdateClusterConfig(changed)
+	err = tx.UpdateClusterConfig(changed)
 	if err != nil {
 		return nil, fmt.Errorf("cannot persist configuration changes: %w", err)
 	}
@@ -441,11 +444,11 @@ var ConfigSchema = config.Schema{
 	"core.https_allowed_credentials": {Type: config.Bool, Default: "false"},
 
 	// lxdmeta:generate(entities=server; group=core; key=core.https_trusted_proxy)
-	// Specify a comma-separated list of IP addresses of trusted servers that provide the client's address through the proxy connection header.
+	// Specify a comma-separated list of IP addresses of trusted servers that provide the client's address through the PROXY protocol connection header.
 	// ---
 	//  type: string
 	//  scope: global
-	//  shortdesc: Trusted servers to provide the client's address
+	//  shortdesc: Trusted servers to provide the client's address via the PROXY protocol
 	"core.https_trusted_proxy": {},
 
 	// lxdmeta:generate(entities=server; group=core; key=core.proxy_http)
@@ -500,6 +503,35 @@ var ConfigSchema = config.Schema{
 	//  defaultdesc: `false`
 	//  shortdesc: Whether to automatically trust clients signed by the CA
 	"core.trust_ca_certificates": {Type: config.Bool, Default: "false"},
+
+	// lxdmeta:generate(entities=server; group=core; key=core.auth_secret_expiry)
+	// The secret is used for various cryptographic purposes, such as cookie encryption.
+	// When a given secret is older than the configured expiry, a new secret is generated.
+	//
+	// This configuration option accepts multiple space-separated values of the form `[0-9]+(S|M|H|d|w|m|y)`,
+	// where `S` is seconds, `M` is minutes, `H` is hours, `d` is days, `w` is weeks, `m` is months, and `y` is years.
+	// For example, `1d 3H` is 1 day and 3 hours.
+	//
+	// The default value is `1m` (1 month).
+	// The minimum value is `1d` (1 day).
+	// ---
+	//  type: string
+	//  scope: global
+	//  defaultdesc: `1m`
+	//  shortdesc: How long to use a given cluster secret
+	"core.auth_secret_expiry": {Default: "1m", Validator: func(s string) error {
+		now := time.Now().UTC()
+		exp, err := shared.GetExpiry(now, s)
+		if err != nil {
+			return err
+		}
+
+		if exp.Sub(now) < 24*time.Hour {
+			return errors.New("Auth secret expiry cannot be set to less than one day")
+		}
+
+		return nil
+	}},
 
 	// lxdmeta:generate(entities=server; group=images; key=images.auto_update_cached)
 	//
@@ -557,15 +589,6 @@ var ConfigSchema = config.Schema{
 	//  shortdesc: How to set the host name for a NIC
 	"instances.nic.host_name": {Validator: validate.Optional(validate.IsOneOf("random", "mac"))},
 
-	// lxdmeta:generate(entities=server; group=miscellaneous; key=instances.placement.scriptlet)
-	// When using custom automatic instance placement logic, this option stores the scriptlet.
-	// See {ref}`clustering-instance-placement-scriptlet` for more information.
-	// ---
-	//  type: string
-	//  scope: global
-	//  shortdesc: Instance placement scriptlet for automatic instance placement
-	"instances.placement.scriptlet": {Validator: validate.Optional(scriptletLoad.InstancePlacementValidate)},
-
 	// lxdmeta:generate(entities=server; group=miscellaneous; key=instances.migration.stateful)
 	// You can override this setting for relevant instances, either in the instance-specific configuration or through a profile.
 	// ---
@@ -573,6 +596,15 @@ var ConfigSchema = config.Schema{
 	//  scope: global
 	//  shortdesc: Whether to set `migration.stateful` to `true` for the instances
 	"instances.migration.stateful": {Type: config.Bool, Default: "false"},
+
+	// TODO: Remove after sunset period
+	// lxdmeta:generate(entities=server; group=miscellaneous; key=user.instances.placement.scriptlet)
+	// Stores the migrated value from the deprecated `instances.placement.scriptlet` configuration key. LXD ignores this key; changing it has no effect. It exists only to preserve previously stored data and may be removed in a future release.
+	//
+	// ---
+	//  type: string
+	//  scope: global
+	//  shortdesc: Legacy storage for `instances.placement.scriptlet` (no effect)
 
 	// lxdmeta:generate(entities=server; group=loki; key=loki.auth.username)
 	//
@@ -766,6 +798,14 @@ var ConfigSchema = config.Schema{
 	//  defaultdesc: Content of `/etc/ovn/key_host` if present
 	//  shortdesc: OVN SSL client key
 	"network.ovn.client_key": {Default: ""},
+
+	// lxdmeta:generate(entities=server; group=miscellaneous; key=volatile.uuid)
+	// This UUID is used as a stable identifier for the cluster. It cannot be changed.
+	// ---
+	//  type: string
+	//  scope: global
+	//  shortdesc: A random v7 UUID
+	"volatile.uuid": {},
 }
 
 func expiryValidator(value string) error {

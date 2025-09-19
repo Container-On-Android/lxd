@@ -12,6 +12,7 @@ import (
 	"github.com/canonical/lxd/lxd/bgp"
 	clusterConfig "github.com/canonical/lxd/lxd/cluster/config"
 	"github.com/canonical/lxd/lxd/db"
+	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/dns"
 	"github.com/canonical/lxd/lxd/endpoints"
 	"github.com/canonical/lxd/lxd/events"
@@ -93,13 +94,10 @@ type State struct {
 	LeaderInfo func() (*LeaderInfo, error)
 
 	// Storage path used by this daemon
-	ImagesStoragePath func() string
+	ImagesStoragePath func(string) string
 
 	// Storage path used by this daemon
-	BackupsStoragePath func() string
-
-	// Local server UUID.
-	ServerUUID string
+	BackupsStoragePath func(string) string
 
 	// Local server start time.
 	StartTime time.Time
@@ -115,6 +113,9 @@ type State struct {
 
 	// StorageReady can be used to track whether all storage pools are successfully started.
 	StorageReady cancel.Canceller
+
+	// CoreAuthSecrets returns the current secrets.
+	CoreAuthSecrets func(ctx context.Context) (cluster.AuthSecrets, error)
 }
 
 // LeaderInfo represents information regarding cluster member leadership.

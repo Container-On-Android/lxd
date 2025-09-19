@@ -1,6 +1,6 @@
 test_network_ovn() {
-  if [ -z "${LXD_OVN_NB_CONNECTION:-}" ]; then
-    echo "OVN northbound connection not set. Skipping OVN tests..."
+  if ! ovn_enabled; then
+    echo "==> SKIP: OVN not configured. Skipping OVN tests..."
     return
   fi
 
@@ -56,15 +56,7 @@ test_network_ovn() {
   reset_row_count
   assert_row_count
 
-  lxc config set network.ovn.northbound_connection "${LXD_OVN_NB_CONNECTION}"
-
-  # If the connection uses SSL we have more required environment variables.
-  # Set the client cert, key, and CA cert.
-  if [[ "${LXD_OVN_NB_CONNECTION}" =~ ^ssl: ]]; then
-    lxc config set network.ovn.client_cert="$(< "${LXD_OVN_NB_CLIENT_CRT_FILE}")"
-    lxc config set network.ovn.client_key="$(< "${LXD_OVN_NB_CLIENT_KEY_FILE}")"
-    lxc config set network.ovn.ca_cert="$(< "${LXD_OVN_NB_CA_CRT_FILE}")"
-  fi
+  setup_ovn
 
   uplink_network="uplink$$"
   ovn_network="ovn$$"
@@ -148,6 +140,22 @@ test_network_ovn() {
   lxc network unset "${uplink_network}" ipv4.routes
   lxc network unset "${uplink_network}" ipv6.routes
 
+  echo "Set ipv4.gateway and ipv6.gateway for the uplink."
+  lxc network set "${uplink_network}" ipv4.gateway=192.0.2.1/24
+  lxc network set "${uplink_network}" ipv6.gateway=2001:db8:1:2::1/64
+
+  echo "Update the uplink's ipv4.routes and ipv6.routes to include the gateway addresses."
+  lxc network set "${uplink_network}" ipv4.routes=192.0.2.0/29
+  lxc network set "${uplink_network}" ipv6.routes=2001:db8:1:2::/125
+
+  echo "Check that automatic allocation does not allocate uplink's ipv4.gateway and ipv6.gateway for forwards."
+  auto_allocate_forwards_ip4 "192.0.2"
+  auto_allocate_forwards_ip6 "2001:db8:1:2"
+
+  echo "Check that automatic allocation does not allocate uplink's ipv4.gateway and ipv6.gateway for load balancers."
+  auto_allocate_load_balancers_ip4 "192.0.2"
+  auto_allocate_load_balancers_ip6 "2001:db8:1:2"
+
   echo "Clean up created networks."
   lxc network delete "${ovn_network}"
   lxc network delete "${uplink_network}"
@@ -213,7 +221,7 @@ test_network_ovn() {
   fi
 
   ovn_encap_iface_name="$(ip -json address | jq -r '.[] | select(.addr_info | .[] | .local == "'"${ovn_encap_ip}"'" ) | .ifname')"
-  ovn_encap_iface_mtu="$(cat "/sys/class/net/${ovn_encap_iface_name}/mtu")"
+  ovn_encap_iface_mtu="$(< "/sys/class/net/${ovn_encap_iface_name}/mtu")"
 
   # MTU is 1500 if overlay MTU is greater than or equal to 1500 plus the overhead.
   # Otherwise it is 1500 minus the overhead.
@@ -254,6 +262,7 @@ test_network_ovn() {
   [ "$(ovn-nbctl get logical_switch "${internal_switch_name}" other_config:exclude_ips)" = '"10.24.140.1"' ]
   [ "$(ovn-nbctl get logical_switch "${internal_switch_name}" other_config:ipv6_prefix)" = '"fd42:bd85:5f89:5293::/64"' ]
   [ "$(ovn-nbctl get logical_switch "${internal_switch_name}" other_config:subnet)" = '"10.24.140.0/24"' ]
+  [ "$(ovn-nbctl get logical_switch "${internal_switch_name}" load_balancer | tr -d '[]' | awk -F, '{print NF}')" = "0" ]
 
   # Check external switch port settings (provider).
   provider_external_switch_port_name="${external_switch_name}-lsp-provider"
@@ -285,7 +294,7 @@ test_network_ovn() {
   [ "$(ovn-nbctl get address_set "${address_set_ipv6_name}" addresses | jq -er '.[0]')" = "fd42:bd85:5f89:5293::/64" ]
 
   # Check internal switch DHCP options (excluding server_mac address which is random).
-  ovn-nbctl --data=bare --no-headings --columns=options find dhcp_options cidr=10.24.140.0/24 | grep -F 'dns_server={10.10.10.1} domain_name="lxd" lease_time=3600 mtu=1442 router=10.24.140.1 server_id=10.24.140.1'
+  ovn-nbctl --data=bare --no-headings --columns=options find dhcp_options cidr=10.24.140.0/24 | grep -F 'dns_server={10.10.10.1} domain_name="lxd" lease_time=3600 mtu='"${mtu}"' router=10.24.140.1 server_id=10.24.140.1'
   ovn-nbctl --data=bare --no-headings --columns=options find dhcp_options cidr="fd42\:bd85\:5f89\:5293\:\:/64" | grep -F 'dns_server={fd42:4242:4242:1010::1} domain_search="lxd"'
 
   # Check that uplink volatile address keys cannot be removed when associated network address is set.
@@ -296,7 +305,7 @@ test_network_ovn() {
   ! lxc network set "${ovn_network}" volatile.network.ipv4.address=10.10.10.199 || false
   ! lxc network set "${ovn_network}" volatile.network.ipv6.address=fd42:4242:4242:1010::199 || false
 
-  # Launch an instance on the OVN network and assert configuration changes.
+  echo "Launch an instance on the OVN network and assert configuration changes."
   lxc launch testimage c1 --network "${ovn_network}"
 
   # Check that this created the expected number of entries.
@@ -344,14 +353,6 @@ test_network_ovn() {
   [ "$(lxc exec c1 -- nslookup "${c1_ipv6_address}" 10.10.10.1 | grep -cF c1.lxd)" = 1 ]
   [ "$(lxc exec c1 -- nslookup "${c1_ipv6_address}" fd42:4242:4242:1010::1 | grep -cF c1.lxd)" = 1 ]
 
-  # Clean up.
-  lxc delete c1 --force
-
-  # Test ha_chassis removal on shutdown
-  shutdown_lxd "${LXD_DIR}"
-  ! ovn-nbctl get ha_chassis "${chassis_id}" priority || false
-  respawn_lxd "${LXD_DIR}" true
-
   echo "Create a couple of forwards without a target address."
   lxc network forward create "${ovn_network}" 192.0.2.1
   lxc network forward create "${ovn_network}" 2001:db8:1:2::1
@@ -376,6 +377,15 @@ test_network_ovn() {
   ! lxc network unset "${uplink_network}" ipv4.routes || false
   ! lxc network unset "${uplink_network}" ipv6.routes || false
 
+  echo "Configure ports for the forwards."
+  lxc network forward port add "${ovn_network}" 192.0.2.1 tcp 80 "${c1_ipv4_address}" 80
+  lxc network forward port add "${ovn_network}" 2001:db8:1:2::1 tcp 80 "${c1_ipv6_address}" 80
+  lxc network forward port add "${ovn_network}" "${volatile_ip4}" udp 162 "${c1_ipv4_address}" 162
+  lxc network forward port add "${ovn_network}" "${volatile_ip6}" udp 162 "${c1_ipv6_address}" 162
+
+  echo "Check that forwards are associated with the internal OVN switch."
+  [ "$(ovn-nbctl get logical_switch "${internal_switch_name}" load_balancer | tr -d '[]' | awk -F, '{print NF}')" = "4" ]
+
   echo "Clean up forwards."
   lxc network forward delete "${ovn_network}" 192.0.2.1
   lxc network forward delete "${ovn_network}" 2001:db8:1:2::1
@@ -397,11 +407,81 @@ test_network_ovn() {
   ! lxc network unset "${uplink_network}" ipv4.routes || false
   ! lxc network unset "${uplink_network}" ipv6.routes || false
 
+  echo "Create a backend for each load balancer."
+  lxc network load-balancer backend add "${ovn_network}" 192.0.2.1 c1-backend "${c1_ipv4_address}" 80
+  lxc network load-balancer backend add "${ovn_network}" 2001:db8:1:2::1 c1-backend "${c1_ipv6_address}" 80
+  lxc network load-balancer backend add "${ovn_network}" "${volatile_ip4}" c1-backend "${c1_ipv4_address}" 162
+  lxc network load-balancer backend add "${ovn_network}" "${volatile_ip6}" c1-backend "${c1_ipv6_address}" 162
+
+  echo "Configure ports for the load balancers."
+  lxc network load-balancer port add "${ovn_network}" 192.0.2.1 tcp 80 c1-backend
+  lxc network load-balancer port add "${ovn_network}" 2001:db8:1:2::1 tcp 80 c1-backend
+  lxc network load-balancer port add "${ovn_network}" "${volatile_ip4}" udp 162 c1-backend
+  lxc network load-balancer port add "${ovn_network}" "${volatile_ip6}" udp 162 c1-backend
+
+  echo "Check that load balancers are associated with the internal OVN switch."
+  [ "$(ovn-nbctl get logical_switch "${internal_switch_name}" load_balancer | tr -d '[]' | awk -F, '{print NF}')" = "4" ]
+
   echo "Clean up load balancers."
   lxc network load-balancer delete "${ovn_network}" 192.0.2.1
   lxc network load-balancer delete "${ovn_network}" 2001:db8:1:2::1
   lxc network load-balancer delete "${ovn_network}" "${volatile_ip4}"
   lxc network load-balancer delete "${ovn_network}" "${volatile_ip6}"
+
+  echo "Test internal OVN network forwards and load balancers."
+
+  echo "Check that no internal forward or load balancer can be created with a listen address of OVN gateway."
+  ! lxc network forward create "${ovn_network}" 10.24.140.1 || false
+  ! lxc network forward create "${ovn_network}" fd42:bd85:5f89:5293::1 || false
+  ! lxc network load-balancer create "${ovn_network}" 10.24.140.1 || false
+  ! lxc network load-balancer create "${ovn_network}" fd42:bd85:5f89:5293::1 || false
+
+  echo "Check that no internal forward or load balancer can be created with a listen address taken by instance NIC."
+  ! lxc network forward create "${ovn_network}" "${c1_ipv4_address}" || false
+  ! lxc network forward create "${ovn_network}" "${c1_ipv6_address}" || false
+  ! lxc network load-balancer create "${ovn_network}" "${c1_ipv4_address}" || false
+  ! lxc network load-balancer create "${ovn_network}" "${c1_ipv6_address}" || false
+
+  echo "Create internal forwards with a listen address that is an internal OVN IP."
+  lxc network forward create "${ovn_network}" 10.24.140.10
+  lxc network forward create "${ovn_network}" fd42:bd85:5f89:5293::10
+
+  echo "Create internal load balancers with a listen address that is an internal OVN IP."
+  lxc network load-balancer create "${ovn_network}" 10.24.140.20
+  lxc network load-balancer create "${ovn_network}" fd42:bd85:5f89:5293::20
+
+  echo "Check that no internal forward or load balancer can be created with a listen address taken by another listener."
+  ! lxc network forward create "${ovn_network}" 10.24.140.10 || false
+  ! lxc network forward create "${ovn_network}" 10.24.140.20 || false
+  ! lxc network forward create "${ovn_network}" fd42:bd85:5f89:5293::10 || false
+  ! lxc network forward create "${ovn_network}" fd42:bd85:5f89:5293::20 || false
+  ! lxc network load-balancer create "${ovn_network}" 10.24.140.10 || false
+  ! lxc network load-balancer create "${ovn_network}" 10.24.140.20 || false
+  ! lxc network load-balancer create "${ovn_network}" fd42:bd85:5f89:5293::10 || false
+  ! lxc network load-balancer create "${ovn_network}" fd42:bd85:5f89:5293::20 || false
+
+  echo "Configure ports for internal forwards."
+  lxc network forward port add "${ovn_network}" 10.24.140.10 tcp 80 "${c1_ipv4_address}" 80
+  lxc network forward port add "${ovn_network}" fd42:bd85:5f89:5293::10 tcp 80 "${c1_ipv6_address}" 80
+
+  echo "Clean up internal forwards."
+  lxc network forward delete "${ovn_network}" 10.24.140.10
+  lxc network forward delete "${ovn_network}" fd42:bd85:5f89:5293::10
+
+  echo "Create a backend for each internal load balancer."
+  lxc network load-balancer backend add "${ovn_network}" 10.24.140.20 c1-backend "${c1_ipv4_address}" 80
+  lxc network load-balancer backend add "${ovn_network}" fd42:bd85:5f89:5293::20 c1-backend "${c1_ipv6_address}" 80
+
+  echo "Configure ports for internal load balancers."
+  lxc network load-balancer port add "${ovn_network}" 10.24.140.20 tcp 80 c1-backend
+  lxc network load-balancer port add "${ovn_network}" fd42:bd85:5f89:5293::20 tcp 80 c1-backend
+
+  echo "Clean up internal load balancers."
+  lxc network load-balancer delete "${ovn_network}" 10.24.140.20
+  lxc network load-balancer delete "${ovn_network}" fd42:bd85:5f89:5293::20
+
+  echo "Clean up the instance."
+  lxc delete c1 --force
 
   echo "Check that instance NIC passthrough with ipv4.routes.external does not allow using volatile.network.ipv4.address."
   ! lxc launch testimage c1 -n "${ovn_network}" -d eth0,ipv4.routes.external="${volatile_ip4}/32" || false
@@ -409,8 +489,77 @@ test_network_ovn() {
   echo "Check that instance NIC passthrough with ipv6.routes.external does not allow using volatile.network.ipv6.address."
   ! lxc launch testimage c1 -n "${ovn_network}" -d eth0,ipv6.routes.external="${volatile_ip6}/128" || false
 
+  echo "Test DHCP reservation."
+
+  echo "Set ipv4.dhcp.ranges for the OVN network that reserve three IPs (10.24.140.10-10.24.140.12)."
+  lxc network set "${ovn_network}" ipv4.dhcp.ranges=10.24.140.10-10.24.140.12
+
+  echo "Launch three instances on the OVN network."
+  lxc launch testimage c1 --network "${ovn_network}"
+  lxc launch testimage c2 --network "${ovn_network}"
+  lxc launch testimage c3 --network "${ovn_network}"
+
+  echo "Bring up the IPv4 interface for each instance."
+  setup_instance_ip4_interface "c1"
+  setup_instance_ip4_interface "c2"
+  setup_instance_ip4_interface "c3"
+
+  echo "Check that the 4th instance creation fails because all reserved dynamic addresses are taken."
+  ! lxc launch testimage c4 --network "${ovn_network}" || false
+
+  echo "Check IPs assigned to instances."
+  [ "$(lxc list -f csv -c 4 c1)" = "10.24.140.10 (eth0)" ]
+  [ "$(lxc list -f csv -c 4 c2)" = "10.24.140.11 (eth0)" ]
+  [ "$(lxc list -f csv -c 4 c3)" = "10.24.140.12 (eth0)" ]
+
+  echo "Check the exclude_ips field on the OVN logical switch, it should contain all IPs except ipv4.dhcp.ranges."
+  [ "$(ovn-nbctl list logical_switch | grep -Fc 'exclude_ips="10.24.140.1..10.24.140.9 10.24.140.13..10.24.140.255"')" = "1" ]
+
+  echo "Delete the instances."
+  lxc delete c1 --force
+  lxc delete c2 --force
+  lxc delete c3 --force
+
+  echo "Test automatic allocation of an allowed external IP addresses for forwards and load balancers."
+
+  echo "Update uplink's routes to include the uplink's IPv4 and IPv6 gateway addresses."
+  lxc network set "${uplink_network}" ipv4.routes=10.10.10.0/29
+  lxc network set "${uplink_network}" ipv6.routes=fd42:4242:4242:1010::/125
+
+  echo "Check that automatic allocation does not allocate uplink's ipv4.address and ipv6.address for forwards."
+  auto_allocate_forwards_ip4 "10.10.10"
+  auto_allocate_forwards_ip6 "fd42:4242:4242:1010"
+
+  echo "Check that automatic allocation does not allocate uplink's ipv4.address and ipv6.address for load balancers."
+  auto_allocate_load_balancers_ip4 "10.10.10"
+  auto_allocate_load_balancers_ip6 "fd42:4242:4242:1010"
+
+  echo "Set ipv4.dhcp.gateway for the uplink."
+  lxc network set "${uplink_network}" ipv4.dhcp.gateway=192.0.2.1
+
+  echo "Update the uplink's ipv4.routes to include the gateway address."
+  lxc network set "${uplink_network}" ipv4.routes=192.0.2.0/29
+
+  echo "Check that automatic allocation does not allocate uplink's ipv4.dhcp.gateway for forwards."
+  auto_allocate_forwards_ip4 "192.0.2"
+
+  echo "Check that automatic allocation does not allocate uplink's ipv4.dhcp.gateway for load balancers."
+  auto_allocate_load_balancers_ip4 "192.0.2"
+
   echo "Delete the OVN network in the default project."
   lxc network delete "${ovn_network}"
+
+  echo "Unset ipv4.dhcp.gateway for the uplink."
+  lxc network unset "${uplink_network}" ipv4.dhcp.gateway
+
+  echo "Reset the uplink's routes."
+  lxc network set "${uplink_network}" ipv4.routes=192.0.2.0/24
+  lxc network set "${uplink_network}" ipv6.routes=2001:db8:1:2::/64
+
+  echo "Test ha_chassis removal on shutdown."
+  shutdown_lxd "${LXD_DIR}"
+  ! ovn-nbctl get ha_chassis "${chassis_id}" priority || false
+  respawn_lxd "${LXD_DIR}" true
 
   ########################################################################################################################
 
@@ -570,11 +719,93 @@ test_network_ovn() {
   reset_row_count
   assert_row_count
 
-  # More clean up.
-  lxc config unset network.ovn.northbound_connection
-  if [[ "${LXD_OVN_NB_CONNECTION}" =~ ^ssl: ]]; then
-    lxc config unset network.ovn.client_cert
-    lxc config unset network.ovn.client_key
-    lxc config unset network.ovn.ca_cert
-  fi
+  unset_ovn_configuration
+}
+
+setup_instance_ip4_interface() {
+  local uuid internal_switch_port_name ipv4_address
+
+  uuid="$(lxc query /1.0/instances/"${1}" | jq -er '.config."volatile.uuid"')"
+  internal_switch_port_name="${chassis_group_name}-instance-${uuid}-eth0"
+
+  ipv4_address="$(ovn-nbctl get logical_switch_port "${internal_switch_port_name}" dynamic_addresses | tr -d '"' | cut -d' ' -f 2)"
+
+  lxc exec "${1}" -- ip -4 addr add "${ipv4_address}/24" dev eth0
+  lxc exec "${1}" -- ip -4 route add default via 10.24.140.1 dev eth0
+}
+
+auto_allocate_forwards_ip4() {
+  # Network X.X.X.0/29 has 5 usable addresses (.2, .3, .4, .5, .6), excluding the uplink's gateway (.1), broadcast address (.7), and network address (.0).
+  echo "Allocate all available IPv4 addresses for forwards."
+  for _ in $(seq 5); do
+    lxc network forward create "${ovn_network}" --allocate=ipv4
+  done
+
+  echo "Check that there is no forward with uplink's IPv4 gateway."
+  ! lxc network forward show "${ovn_network}" "${1}.1" || false
+
+  echo "Check that there is no more available IPv4 addresses left."
+  ! lxc network forward create "${ovn_network}" --allocate=ipv4 || false
+
+  echo "Clean up forwards."
+  for i in $(seq 2 6); do
+    lxc network forward delete "${ovn_network}" "${1}.${i}"
+  done
+}
+
+auto_allocate_forwards_ip6() {
+  # Network X:X:X:X::/125 has 6 usable addresses (::2, ::3, ::4, ::5, ::6, ::7), excluding the uplink's gateway (::1) and the subnet-router anycast address (::).
+  echo "Allocate all available IPv6 addresses for forwards."
+  for _ in $(seq 6); do
+    lxc network forward create "${ovn_network}" --allocate=ipv6
+  done
+
+  echo "Check that there is no forward with uplink's IPv6 gateway."
+  ! lxc network forward show "${ovn_network}" "${1}::1" || false
+
+  echo "Check that there is no more available IPv6 addresses left."
+  ! lxc network forward create "${ovn_network}" --allocate=ipv6 || false
+
+  echo "Clean up forwards."
+  for i in $(seq 2 7); do
+    lxc network forward delete "${ovn_network}" "${1}::${i}"
+  done
+}
+
+auto_allocate_load_balancers_ip4() {
+  # Network X.X.X.0/29 has 5 usable addresses (.2, .3, .4, .5, .6), excluding the uplink's gateway (.1), broadcast address (.7), and network address (.0).
+  echo "Allocate all available IPv4 addresses for load balancers."
+  for _ in $(seq 5); do
+    lxc network load-balancer create "${ovn_network}" --allocate=ipv4
+  done
+
+  echo "Check that there is no load balancer with uplink's IPv4 gateway."
+  ! lxc network load-balancer show "${ovn_network}" "${1}.1" || false
+
+  echo "Check that there is no more available IPv4 addresses left."
+  ! lxc network load-balancer create "${ovn_network}" --allocate=ipv4 || false
+
+  echo "Clean up load balancers."
+  for i in $(seq 2 6); do
+    lxc network load-balancer delete "${ovn_network}" "${1}.${i}"
+  done
+}
+
+auto_allocate_load_balancers_ip6() {
+  # Network X:X:X:X::/125 has 6 usable addresses (::2, ::3, ::4, ::5, ::6, ::7), excluding the uplink's gateway (::1) and the subnet-router anycast address (::).
+  echo "Allocate all available IPv6 addresses for load balancers."
+  for _ in $(seq 6); do
+    lxc network load-balancer create "${ovn_network}" --allocate=ipv6
+  done
+
+  echo "Check that there is no load balancer with uplink's IPv6 gateway."
+  ! lxc network load-balancer show "${ovn_network}" "${1}::1" || false
+
+  echo "Check that there is no more available IPv6 addresses left."
+  ! lxc network load-balancer create "${ovn_network}" --allocate=ipv6 || false
+
+  echo "Clean up load balancers."
+  for i in $(seq 2 7); do
+    lxc network load-balancer delete "${ovn_network}" "${1}::${i}"
+  done
 }

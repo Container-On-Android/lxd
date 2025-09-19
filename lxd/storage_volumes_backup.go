@@ -167,10 +167,9 @@ func storagePoolVolumeTypeCustomBackupsGet(d *Daemon, r *http.Request) response.
 		return response.SmartError(err)
 	}
 
-	var effectiveProjectName string
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo != nil {
-		effectiveProjectName = reqInfo.EffectiveProjectName
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	details, err := request.GetContextValue[storageVolumeDetails](r.Context(), ctxStorageVolumeDetails)
@@ -298,13 +297,11 @@ func storagePoolVolumeTypeCustomBackupsPost(d *Daemon, r *http.Request) response
 		return response.BadRequest(fmt.Errorf("Invalid storage volume type %q", details.volumeTypeName))
 	}
 
-	var effectiveProjectName string
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo != nil {
-		effectiveProjectName = reqInfo.EffectiveProjectName
-	}
-
 	requestProjectName := request.ProjectParam(r)
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	target := request.QueryParam(r, "target")
 	resp := forwardedResponseToNode(r.Context(), s, target)
@@ -432,7 +429,7 @@ func storagePoolVolumeTypeCustomBackupsPost(d *Daemon, r *http.Request) response
 			return fmt.Errorf("Create volume backup: %w", err)
 		}
 
-		s.Events.SendLifecycle(effectiveProjectName, lifecycle.StorageVolumeBackupCreated.Event(details.pool.Name(), details.volumeTypeName, args.Name, effectiveProjectName, op.Requestor(), logger.Ctx{"type": details.volumeTypeName}))
+		s.Events.SendLifecycle(effectiveProjectName, lifecycle.StorageVolumeBackupCreated.Event(details.pool.Name(), details.volumeTypeName, args.Name, effectiveProjectName, op.EventLifecycleRequestor(), logger.Ctx{"type": details.volumeTypeName}))
 
 		return nil
 	}
@@ -513,10 +510,9 @@ func storagePoolVolumeTypeCustomBackupGet(d *Daemon, r *http.Request) response.R
 		return response.BadRequest(fmt.Errorf("Invalid storage volume type %q", details.volumeTypeName))
 	}
 
-	var effectiveProjectName string
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo != nil {
-		effectiveProjectName = reqInfo.EffectiveProjectName
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	target := request.QueryParam(r, "target")
@@ -596,13 +592,11 @@ func storagePoolVolumeTypeCustomBackupPost(d *Daemon, r *http.Request) response.
 		return response.BadRequest(fmt.Errorf("Invalid storage volume type %q", details.volumeTypeName))
 	}
 
-	var effectiveProjectName string
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo != nil {
-		effectiveProjectName = reqInfo.EffectiveProjectName
-	}
-
 	requestProjectName := request.ProjectParam(r)
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	target := request.QueryParam(r, "target")
 	resp := forwardedResponseToNode(r.Context(), s, target)
@@ -642,7 +636,7 @@ func storagePoolVolumeTypeCustomBackupPost(d *Daemon, r *http.Request) response.
 			return err
 		}
 
-		s.Events.SendLifecycle(effectiveProjectName, lifecycle.StorageVolumeBackupRenamed.Event(details.pool.Name(), details.volumeTypeName, newName, effectiveProjectName, op.Requestor(), logger.Ctx{"old_name": oldName}))
+		s.Events.SendLifecycle(effectiveProjectName, lifecycle.StorageVolumeBackupRenamed.Event(details.pool.Name(), details.volumeTypeName, newName, effectiveProjectName, op.EventLifecycleRequestor(), logger.Ctx{"old_name": oldName}))
 
 		return nil
 	}
@@ -709,13 +703,11 @@ func storagePoolVolumeTypeCustomBackupDelete(d *Daemon, r *http.Request) respons
 		return response.BadRequest(fmt.Errorf("Invalid storage volume type %q", details.volumeTypeName))
 	}
 
-	var effectiveProjectName string
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo != nil {
-		effectiveProjectName = reqInfo.EffectiveProjectName
-	}
-
 	requestProjectName := request.ProjectParam(r)
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	target := request.QueryParam(r, "target")
 	resp := forwardedResponseToNode(r.Context(), s, target)
@@ -741,7 +733,7 @@ func storagePoolVolumeTypeCustomBackupDelete(d *Daemon, r *http.Request) respons
 			return err
 		}
 
-		s.Events.SendLifecycle(effectiveProjectName, lifecycle.StorageVolumeBackupDeleted.Event(details.pool.Name(), details.volumeTypeName, fullName, effectiveProjectName, op.Requestor(), nil))
+		s.Events.SendLifecycle(effectiveProjectName, lifecycle.StorageVolumeBackupDeleted.Event(details.pool.Name(), details.volumeTypeName, fullName, effectiveProjectName, op.EventLifecycleRequestor(), nil))
 
 		return nil
 	}
@@ -804,10 +796,9 @@ func storagePoolVolumeTypeCustomBackupExportGet(d *Daemon, r *http.Request) resp
 		return response.BadRequest(fmt.Errorf("Invalid storage volume type %q", details.volumeTypeName))
 	}
 
-	var effectiveProjectName string
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo != nil {
-		effectiveProjectName = reqInfo.EffectiveProjectName
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	target := request.QueryParam(r, "target")
@@ -830,7 +821,7 @@ func storagePoolVolumeTypeCustomBackupExportGet(d *Daemon, r *http.Request) resp
 	}
 
 	ent := response.FileResponseEntry{
-		Path: filepath.Join(s.BackupsStoragePath(), "custom", details.pool.Name(), project.StorageVolume(effectiveProjectName, fullName)),
+		Path: filepath.Join(s.BackupsStoragePath(effectiveProjectName), "custom", details.pool.Name(), project.StorageVolume(effectiveProjectName, fullName)),
 	}
 
 	s.Events.SendLifecycle(effectiveProjectName, lifecycle.StorageVolumeBackupRetrieved.Event(details.pool.Name(), details.volumeTypeName, fullName, effectiveProjectName, request.CreateRequestor(r.Context()), nil))

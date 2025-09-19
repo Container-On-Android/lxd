@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 
+	agentAPI "github.com/canonical/lxd/lxd-agent/api"
 	"github.com/canonical/lxd/lxd/backup"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
@@ -46,7 +47,7 @@ var ErrExecCommandNotFound = api.StatusErrorf(http.StatusBadRequest, "Command no
 var ErrExecCommandNotExecutable = api.StatusErrorf(http.StatusBadRequest, "Command not executable")
 
 // ErrInstanceIsStopped indicates that the instance is stopped.
-var ErrInstanceIsStopped error = api.StatusErrorf(http.StatusBadRequest, "The instance is already stopped")
+var ErrInstanceIsStopped = api.StatusErrorf(http.StatusBadRequest, "The instance is already stopped")
 
 // deviceManager is an interface that allows managing device lifecycle.
 type deviceManager interface {
@@ -487,12 +488,14 @@ func (d *common) deviceVolatileReset(devName string, oldConfig, newConfig device
 func (d *common) deviceVolatileGetFunc(devName string) func() map[string]string {
 	return func() map[string]string {
 		volatile := make(map[string]string)
-		prefix := fmt.Sprintf("volatile.%s.", devName)
+		prefix := "volatile." + devName + "."
 		for k, v := range d.localConfig {
-			if strings.HasPrefix(k, prefix) {
-				volatile[strings.TrimPrefix(k, prefix)] = v
+			after, ok := strings.CutPrefix(k, prefix)
+			if ok {
+				volatile[after] = v
 			}
 		}
+
 		return volatile
 	}
 }
@@ -510,18 +513,20 @@ func (d *common) deviceVolatileSetFunc(devName string) func(save map[string]stri
 	}
 }
 
-// postMigrateSendCommon handles the common part of instance post-migration send.
-func (d *common) postMigrateSendCommon(inst instance.Instance) error {
+// postMigrateSendCommon handles common instance post-migration steps.
+func (d *common) postMigrateSendCommon(inst instance.Instance, clusterMoveSourceName string) error {
 	// Perform post-migration device cleanup.
 	for devName, devConfig := range d.ExpandedDevices() {
 		dev, err := d.deviceLoad(inst, devName, devConfig)
 		if err != nil {
-			return err
+			logger.Error("Failed to load device %q during post-migration steps on source: %v", logger.Ctx{"devName": devName, "err": err})
 		}
 
-		err = dev.PostMigrateSend()
-		if err != nil {
-			return err
+		if dev != nil {
+			err = dev.PostMigrateSend(clusterMoveSourceName)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -530,7 +535,7 @@ func (d *common) postMigrateSendCommon(inst instance.Instance) error {
 
 // expandConfig applies the config of each profile in order, followed by the local config.
 func (d *common) expandConfig() error {
-	var globalConfigDump map[string]any
+	var globalConfigDump map[string]string
 	if d.state.GlobalConfig != nil {
 		globalConfigDump = d.state.GlobalConfig.Dump()
 	}
@@ -709,7 +714,11 @@ func (d *common) runHooks(hooks []func() error) error {
 	return nil
 }
 
-// snapshot handles the common part of the snapshoting process.
+// snapshotCommon handles the common part of a snapshot.
+// It creates the DB record and snapshots the instance, derives expiry from
+// inst's "snapshots.expiry"" if expiry is nil, mounts the instance to update
+// backup.yaml, and reverts on error. The snapshot is marked stateful when
+// stateful is true.
 func (d *common) snapshotCommon(inst instance.Instance, name string, expiry *time.Time, stateful bool) error {
 	revert := revert.New()
 	defer revert.Fail()
@@ -806,6 +815,103 @@ func (d *common) updateProgress(progress string) {
 		meta["container_progress"] = progress
 		_ = d.op.UpdateMetadata(meta)
 	}
+}
+
+// restoreCommon handles the common part of a restore.
+// It loads the instance's storage pool and creates a restore operation lock.
+// If the instance is running, it temporarily clears the ephemeral flag (if set),
+// stops the instance (which unmounts its storage), and then refreshes the restore
+// operation lock. The original ephemeral flag is restored on return.
+// It then applies the configuration from the source instance or snapshot to the
+// target instance and updates snapshot metadata.
+//
+// Returns:
+// - pool: the instance's storage pool.
+// - wasRunning: whether the instance was running before restore.
+// - op: the restore operation lock.
+// - err: error, if any.
+func (d *common) restoreCommon(inst instance.Instance, source instance.Instance) (pool storagePools.Pool, wasRunning bool, op *operationlock.InstanceOperation, err error) {
+	// Load the storage driver.
+	pool, err = storagePools.LoadByInstance(d.state, inst)
+	if err != nil {
+		return nil, false, nil, err
+	}
+
+	op, err = operationlock.Create(d.Project().Name, d.Name(), operationlock.ActionRestore, false, false)
+	if err != nil {
+		return nil, false, nil, fmt.Errorf("Failed to create instance restore operation: %w", err)
+	}
+
+	// Stop the instance.
+	wasRunning = inst.IsRunning()
+	if wasRunning {
+		ephemeral := d.IsEphemeral()
+		if ephemeral {
+			// Unset ephemeral flag.
+			args := db.InstanceArgs{
+				Architecture: d.Architecture(),
+				Config:       d.LocalConfig(),
+				Description:  d.Description(),
+				Devices:      d.LocalDevices(),
+				Ephemeral:    false,
+				Profiles:     d.Profiles(),
+				Project:      d.Project().Name,
+				Type:         d.Type(),
+				Snapshot:     d.IsSnapshot(),
+			}
+
+			err := inst.Update(args, false)
+			if err != nil {
+				op.Done(err)
+				return nil, false, nil, err
+			}
+
+			// On function return, set the flag back on.
+			defer func() {
+				args.Ephemeral = ephemeral
+				err = inst.Update(args, false)
+				if err != nil {
+					d.logger.Error("Failed to restore ephemeral flag after restore", logger.Ctx{"err": err})
+				}
+			}()
+		}
+
+		// This will unmount the instance storage.
+		err := inst.Stop(false)
+		if err != nil {
+			op.Done(err)
+			return nil, false, nil, err
+		}
+
+		// Refresh the operation as that one is now complete.
+		op, err = operationlock.Create(d.Project().Name, d.Name(), operationlock.ActionRestore, false, false)
+		if err != nil {
+			return nil, false, nil, fmt.Errorf("Failed to create instance restore operation: %w", err)
+		}
+	}
+
+	// Restore the configuration.
+	args := db.InstanceArgs{
+		Architecture: source.Architecture(),
+		Config:       source.LocalConfig(),
+		Description:  source.Description(),
+		Devices:      source.LocalDevices(),
+		Ephemeral:    source.IsEphemeral(),
+		Profiles:     source.Profiles(),
+		Project:      source.Project().Name,
+		Type:         source.Type(),
+		Snapshot:     source.IsSnapshot(),
+	}
+
+	// Don't pass as user-requested as there's no way to fix a bad config.
+	// This will call d.UpdateBackupFile() to ensure snapshot list is up to date.
+	err = inst.Update(args, false)
+	if err != nil {
+		op.Done(err)
+		return nil, false, nil, err
+	}
+
+	return pool, wasRunning, op, nil
 }
 
 // insertConfigkey function attempts to insert the instance config key into the database. If the insert fails
@@ -1406,7 +1512,7 @@ func (d *common) deviceLoad(inst instance.Instance, deviceName string, rawConfig
 	dev, err := device.New(inst, d.state, deviceName, configCopy, d.deviceVolatileGetFunc(deviceName), d.deviceVolatileSetFunc(deviceName))
 
 	// If validation fails with unsupported device type then don't return the device for use.
-	if errors.Is(err, device.ErrUnsupportedDevType) {
+	if err != nil && errors.Is(err, device.ErrUnsupportedDevType) {
 		return nil, err
 	}
 
@@ -1540,7 +1646,7 @@ func (d *common) devicesUpdate(inst instance.Instance, removeDevices deviceConfi
 				}
 
 				devlxdEvents = append(devlxdEvents, map[string]any{
-					"action": "removed",
+					"action": agentAPI.DeviceRemoved,
 					"name":   entry.Name,
 					"config": entry.Config,
 				})
@@ -1608,7 +1714,7 @@ func (d *common) devicesUpdate(inst instance.Instance, removeDevices deviceConfi
 			revert.Add(func() { _ = dm.deviceStop(dev, instanceRunning, "") })
 
 			event := map[string]any{
-				"action": "added",
+				"action": agentAPI.DeviceAdded,
 				"name":   entry.Name,
 				"config": entry.Config,
 			}
@@ -1672,7 +1778,7 @@ func (d *common) devicesUpdate(inst instance.Instance, removeDevices deviceConfi
 					}
 
 					devlxdEvents = append(devlxdEvents, map[string]any{
-						"action": "updated",
+						"action": agentAPI.DeviceUpdated,
 						"name":   entry.Name,
 						"config": entry.Config,
 					})

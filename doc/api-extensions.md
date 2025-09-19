@@ -2115,12 +2115,6 @@ Adds a `txqueuelen` key to control the `txqueuelen` parameter of the NIC device.
 
 Adds `GET /1.0/cluster/members/<member>/state` API endpoint and associated `ClusterMemberState` API response type.
 
-## `instances_placement_scriptlet`
-
-Adds support for a Starlark scriptlet to be provided to LXD to allow customized logic that controls placement of new instances in a cluster.
-
-The Starlark scriptlet is provided to LXD via the new global configuration option {config:option}`server-miscellaneous:instances.placement.scriptlet`.
-
 ## `storage_pool_source_wipe`
 Adds support for a `source.wipe` Boolean on the storage pool, indicating
 that LXD should wipe partition headers off the requested disk rather
@@ -2476,6 +2470,8 @@ for a project, the pool is excluded from `lxc storage list` in that project.
 Adds a new {config:option}`instance-miscellaneous:ubuntu_pro.guest_attach` configuration option for instances.
 When set to `on`, if the host has guest attachment enabled, the guest can request a guest token for Ubuntu Pro via `devlxd`.
 
+For more information, see: {ref}`instances-ubuntu-pro-attach`.
+
 ## `metadata_configuration_entity_types`
 
 This adds entity type metadata to `GET /1.0/metadata/configuration`.
@@ -2577,7 +2573,7 @@ This adds support for listing profiles across all projects using the `all-projec
 Adds a new `powerflex` storage driver which allows the consumption of storage volumes from a Dell PowerFlex storage array using NVMe/TCP and SDC.
 The following new pool level configuration keys have been added:
 
-1. {config:option}`storage-powerflex-pool-conf:powerflex.clone_copy`
+1. {config:option}`storage-powerflex-pool-conf:powerflex.snapshot_copy`
 1. {config:option}`storage-powerflex-pool-conf:powerflex.domain`
 1. {config:option}`storage-powerflex-pool-conf:powerflex.gateway`
 1. {config:option}`storage-powerflex-pool-conf:powerflex.gateway.verify`
@@ -2682,3 +2678,84 @@ Adds the {config:option}`device-disk-device-conf:io.threads` option on `disk` de
 This adds support for the {config:option}`server-oidc:oidc.client.secret` configuration key.
 If set, the LXD server will use this value in the OpenID Connect (OIDC) authorization code flow, which is used by LXD UI.
 This configuration value is not shared with other LXD clients (such as the LXD CLI).
+
+## `pci_hotplug`
+This adds PCI device hotplugging for VMs.
+
+## `device_patch_removal`
+The `PATCH /1.0/instances/{name}` endpoint allows removing an instance device by setting its value to `null` in the devices map.
+
+## `auth_secrets`
+
+This adds a new, cluster-wide core secret.
+All encryption keys are derived from the core secret using a random salt.
+Derived keys are used to encrypt OIDC credential cookies, and will be used for other general encryption purposes in the future.
+
+The {config:option}`server-core:core.auth_secret_expiry` configuration option can set to define how long a given secret can be used for before it expires.
+
+## `daemon_storage_per_project`
+
+This introduces two new configuration keys {config:option}`server-miscellaneous:storage.project.{name}.images_volume` and
+{config:option}`server-miscellaneous:storage.project.{name}.backups_volume` per each project to allow for a storage volume on an existing
+pool be used for storing the project-specific images and backups artifacts.
+
+## `ovn_internal_load_balancer`
+
+This introduces support for internal OVN load balancers and network forwards. This approach allows `ovn` networks to define ports on internal IP addresses that can be forwarded to other internal IPs inside their respective networks.
+This change removes the previous limitation on `ovn` networks that load balancers and network forwards could only use external IP addresses to forward to internal IPs.
+
+## `auth_bearer_devlxd`
+
+Adds a new `bearer` authentication method and enables authentication to the DevLXD API.
+See {ref}`DevLXD bearer tokens <devlxd-authentication-bearer>`.
+
+## `devlxd_volume_management`
+
+Enables additional DevLXD endpoints for managing custom storage volumes and instance devices when `security.devlxd.management.volumes` is set to true.
+These endpoints are primarily intended for use by the LXD CSI driver.
+
+Management is limited to custom storage volumes.
+Additionally, the client is required to authenticate using DevLXD identity, which is used to track storage volume and instance device owner.
+Volumes and instance devices created through the DevLXD are marked as owned by the authenticated identity and can later be modified or removed through DevLXD only by the same identity.
+
+New DevLXD endpoints:
+
+* `GET /1.0/storage-pools/{pool}` — Retrieve a storage pool.
+* `GET /1.0/storage-pools/{pool}/volumes` — List owned custom volumes in a pool.
+* `GET /1.0/storage-pools/{pool}/volumes/{volume}` — Retrieve an owned custom volume.
+* `POST /1.0/storage-pools/{pool}/volumes` — Create a new owned custom volume in a pool.
+* `PUT /1.0/storage-pools/{pool}/volumes/{volume}` — Update an owned custom volume.
+* `DELETE /1.0/storage-pools/{pool}/volumes/{volume}` — Delete an owned custom volume.
+* `GET /1.0/instances/{inst}` — Retrieve an instance and its owned devices.
+* `PATCH /1.0/instances/{inst}` — Add new instance devices or modify owned devices.
+
+Changes to existing DevLXD endpoints:
+
+* `GET /1.0` — Adds a `supported_storage_drivers` field to the response, which is populated when `security.devlxd.management.volumes` is enabled.
+
+## `storage_driver_alletra`
+
+Adds a new `alletra` storage driver for the consumption of storage volumes from an HPE Alletra storage array.
+
+The following pool-level configuration keys have been added:
+
+1. {config:option}`storage-alletra-pool-conf:alletra.wsapi`
+1. {config:option}`storage-alletra-pool-conf:alletra.wsapi.verify`
+1. {config:option}`storage-alletra-pool-conf:alletra.user.name`
+1. {config:option}`storage-alletra-pool-conf:alletra.user.password`
+1. {config:option}`storage-alletra-pool-conf:alletra.cpg`
+1. {config:option}`storage-alletra-pool-conf:alletra.target`
+1. {config:option}`storage-alletra-pool-conf:alletra.mode`
+
+## `resources_disk_used_by`
+
+Adds the field `used_by` to potential storage disk returned by the resources end point to indicate its use by any virtual parent device, e.g. `bcache`.
+
+## `ovn_dhcp_ranges`
+
+This introduces support for the {config:option}`network-ovn-network-conf:ipv4.dhcp.ranges` configuration key for `ovn` networks. This key allows specifying a list of IPv4 ranges
+reserved for dynamic allocation using DHCP.
+
+## `operation_requestor`
+
+This adds a new `requestor` field to operations, which contains information about the caller that initiated the operation.

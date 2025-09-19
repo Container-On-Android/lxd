@@ -11,6 +11,7 @@ import (
 
 	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/identity"
+	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
 	"github.com/canonical/lxd/shared/logger"
@@ -27,15 +28,9 @@ func init() {
 
 type tls struct {
 	commonAuthorizer
-	identities *identity.Cache
 }
 
 func (t *tls) load(ctx context.Context, identityCache *identity.Cache, opts Opts) error {
-	if identityCache == nil {
-		return errors.New("TLS authorization driver requires an identity cache")
-	}
-
-	t.identities = identityCache
 	return nil
 }
 
@@ -51,23 +46,24 @@ func (t *tls) CheckPermission(ctx context.Context, entityURL *api.URL, entitleme
 		return fmt.Errorf("Cannot check permissions for entity type %q and entitlement %q: %w", entityType, entitlement, err)
 	}
 
+	requestor, err := request.GetRequestor(ctx)
+	if err != nil {
+		return err
+	}
+
 	// Untrusted requests are denied.
-	if !auth.IsTrusted(ctx) {
+	if !requestor.IsTrusted() {
 		return api.NewGenericStatusError(http.StatusForbidden)
 	}
 
-	isRoot, err := auth.IsServerAdmin(ctx, t.identities)
-	if err != nil {
-		return fmt.Errorf("Failed to check caller privilege: %w", err)
-	}
-
-	if isRoot {
+	// Cluster or unix socket requests have admin permission.
+	if requestor.IsAdmin() {
 		return nil
 	}
 
-	id, err := auth.GetIdentityFromCtx(ctx, t.identities)
-	if err != nil {
-		return fmt.Errorf("Failed to get caller identity: %w", err)
+	id := requestor.CallerIdentity()
+	if id == nil {
+		return errors.New("No identity is set in the request details")
 	}
 
 	if id.IdentityType == api.IdentityTypeCertificateMetricsUnrestricted && entitlement == auth.EntitlementCanViewMetrics {
@@ -96,6 +92,12 @@ func (t *tls) CheckPermission(ctx context.Context, entityURL *api.URL, entitleme
 	return nil
 }
 
+// CheckPermissionWithoutEffectiveProject calls CheckPermission. This is because the TLS auth driver does not need to consider
+// the effective project at all.
+func (t *tls) CheckPermissionWithoutEffectiveProject(ctx context.Context, entityURL *api.URL, entitlement auth.Entitlement) error {
+	return t.CheckPermission(ctx, entityURL, entitlement)
+}
+
 // GetPermissionChecker returns a function that can be used to check whether a user has the required entitlement on an authorization object.
 func (t *tls) GetPermissionChecker(ctx context.Context, entitlement auth.Entitlement, entityType entity.Type) (auth.PermissionChecker, error) {
 	err := auth.ValidateEntitlement(entityType, entitlement)
@@ -109,22 +111,24 @@ func (t *tls) GetPermissionChecker(ctx context.Context, entitlement auth.Entitle
 		}
 	}
 
-	if !auth.IsTrusted(ctx) {
+	requestor, err := request.GetRequestor(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Untrusted requests are denied.
+	if !requestor.IsTrusted() {
 		return allowFunc(false), nil
 	}
 
-	isRoot, err := auth.IsServerAdmin(ctx, t.identities)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to check caller privilege: %w", err)
-	}
-
-	if isRoot {
+	// Cluster or unix socket requests have admin permission.
+	if requestor.IsAdmin() {
 		return allowFunc(true), nil
 	}
 
-	id, err := auth.GetIdentityFromCtx(ctx, t.identities)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to get caller identity: %w", err)
+	id := requestor.CallerIdentity()
+	if id == nil {
+		return nil, errors.New("No identity is set in the request details")
 	}
 
 	if id.IdentityType == api.IdentityTypeCertificateMetricsUnrestricted && entitlement == auth.EntitlementCanViewMetrics {
@@ -160,10 +164,20 @@ func (t *tls) GetPermissionChecker(ctx context.Context, entitlement auth.Entitle
 	}, nil
 }
 
+// GetPermissionCheckerWithoutEffectiveProject calls GetPermissionChecker. This is because the TLS auth driver does not need to consider
+// the effective project at all.
+func (t *tls) GetPermissionCheckerWithoutEffectiveProject(ctx context.Context, entitlement auth.Entitlement, entityType entity.Type) (auth.PermissionChecker, error) {
+	return t.GetPermissionChecker(ctx, entitlement, entityType)
+}
+
 func (t *tls) allowProjectUnspecificEntityType(entitlement auth.Entitlement, entityType entity.Type, id *identity.CacheEntry, projectName string, pathArguments []string) bool {
 	switch entityType {
 	case entity.TypeServer:
 		// Restricted TLS certificates have the following entitlements on server.
+		//
+		// Note: We have to keep EntitlementCanViewMetrics here for backwards compatibility with older versions of LXD.
+		// Historically when viewing the metrics endpoint for a specific project with a restricted certificate also the
+		// internal server metrics get returned.
 		return slices.Contains([]auth.Entitlement{auth.EntitlementCanViewResources, auth.EntitlementCanViewMetrics, auth.EntitlementCanViewUnmanagedNetworks}, entitlement)
 	case entity.TypeIdentity:
 		// If the entity URL refers to the identity that made the request, then the second path argument of the URL is

@@ -143,7 +143,7 @@ type Cluster struct {
 // schema update can't be performed right now, because some nodes are still
 // behind, an Upgrading error is returned.
 // Accepts a closingCtx context argument used to indicate when the daemon is shutting down.
-func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore, address, dir string, timeout time.Duration, dump *Dump, options ...driver.Option) (*Cluster, error) {
+func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore, address, dir string, timeout time.Duration, dump *Dump, serverUUID string, options ...driver.Option) (*Cluster, error) {
 	db, err := cluster.Open(name, store, options...)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to open database: %w", err)
@@ -203,7 +203,7 @@ func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore
 	}
 
 	if dump != nil {
-		logger.Infof("Migrating data from local to global database")
+		logger.Info("Migrating data from local to global database")
 		err := query.Transaction(closingCtx, db, func(ctx context.Context, tx *sql.Tx) error {
 			return importPreClusteringData(tx, dump)
 		})
@@ -227,7 +227,7 @@ func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore
 		}
 	}
 
-	err = cluster.EnsureSchema(db, address, dir)
+	err = cluster.EnsureSchema(db, address, dir, serverUUID)
 	if err != nil {
 		if api.StatusErrorCheck(err, http.StatusPreconditionFailed) {
 			cluster := &Cluster{
@@ -389,7 +389,7 @@ func (c *Cluster) transaction(ctx context.Context, f func(context.Context, *Clus
 		}
 
 		err := query.Transaction(ctx, c.db, txFunc)
-		if errors.Is(err, context.DeadlineExceeded) {
+		if err != nil && errors.Is(err, context.DeadlineExceeded) {
 			// If the query timed out it likely means that the leader has abruptly become unreachable.
 			// Now that this query has been cancelled, a leader election should have taken place by now.
 			// So let's retry the transaction once more in case the global database is now available again.

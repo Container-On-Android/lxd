@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/canonical/lxd/lxd/device/filters"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/units"
@@ -75,20 +76,6 @@ func ValidSnapName(snapshotName string) error {
 	return nil
 }
 
-// IsRootDiskDevice returns true if the given device representation is configured as root disk for
-// an instance. It typically get passed a specific entry of api.Instance.Devices.
-func IsRootDiskDevice(device map[string]string) bool {
-	// Root disk devices also need a non-empty "pool" property, but we can't check that here
-	// because this function is used with clients talking to older servers where there was no
-	// concept of a storage pool, and also it is used for migrating from old to new servers.
-	// The validation of the non-empty "pool" property is done inside the disk device itself.
-	if device["type"] == "disk" && device["path"] == "/" && device["source"] == "" {
-		return true
-	}
-
-	return false
-}
-
 // ErrNoRootDisk means there is no root disk device found.
 var ErrNoRootDisk = errors.New("No root device could be found")
 
@@ -99,7 +86,7 @@ func GetRootDiskDevice(devices map[string]map[string]string) (string, map[string
 	var dev map[string]string
 
 	for n, d := range devices {
-		if IsRootDiskDevice(d) {
+		if filters.IsRootDisk(d) {
 			if devName != "" {
 				return "", nil, errors.New("More than one root device found")
 			}
@@ -125,7 +112,9 @@ var HugePageSizeSuffix = [...]string{"64KB", "1MB", "2MB", "1GB"}
 // InstanceConfigKeysAny is a map of config key to validator. (keys applying to containers AND virtual machines).
 var InstanceConfigKeysAny = map[string]func(value string) error{
 	// lxdmeta:generate(entities=instance; group=boot; key=boot.autostart)
-	// If set to `false`, restore the last state.
+	// If set to `true`, the instance will always be auto-started, unless `security.protection.start` is also enabled.
+	// If set to `false`, the instance will not be started on LXD start up.
+	// If this option is not set, the instance will be restored to its last known state.
 	// ---
 	//  type: bool
 	//  liveupdate: no
@@ -353,6 +342,15 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	//  shortdesc: Controls the availability of the `/1.0/images` API over `devlxd`
 	"security.devlxd.images": validate.Optional(validate.IsBool),
 
+	// lxdmeta:generate(entities=instance; group=security; key=security.devlxd.management.volumes)
+	//
+	// ---
+	//  type: bool
+	//  defaultdesc: `false`
+	//  liveupdate: yes
+	//  shortdesc: Controls the availability of the volume management API over `devlxd`
+	"security.devlxd.management.volumes": validate.Optional(validate.IsBool),
+
 	// lxdmeta:generate(entities=instance; group=security; key=security.protection.delete)
 	//
 	// ---
@@ -417,7 +415,7 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	// lxdmeta:generate(entities=instance; group=miscellaneous; key=ubuntu_pro.guest_attach)
 	// Indicate whether the guest should auto-attach Ubuntu Pro at start up.
 	//
-	// See {ref}`ubuntu-pro-guest-attach` for more information.
+	// See {ref}`instances-ubuntu-pro-attach` for more information.
 	// ---
 	// type: string
 	// liveupdate: no
@@ -1378,6 +1376,16 @@ func ConfigKeyChecker(key string, instanceType Type) (func(value string) error, 
 
 		if strings.HasSuffix(key, ".last_state.ready") {
 			return validate.IsBool, nil
+		}
+
+		// lxdmeta:generate(entities=instance; group=volatile; key=volatile.<name>.devlxd.owner)
+		// ID of the DevLXD identity that owns the device. It is used by DevLXD to restrict
+		// access of an identity to devices that were created by that identity.
+		// ---
+		//  type: string
+		//  shortdesc: DevLXD identity ID that owns the device.
+		if strings.HasSuffix(key, ".devlxd.owner") {
+			return validate.IsAny, nil
 		}
 	}
 

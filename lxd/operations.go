@@ -78,8 +78,7 @@ func pendingInstanceOperations() (map[string]*operations.Operation, error) {
 
 		// If the current operations has a hold on some resources, we keep track of them in the `resourceMap`.
 		// This is used to mark instances and storage volumes as busy to avoid shutting them down / unmounting them prematurely.
-		// This allows the waitForOperations to be called in a goroutine alongside the instance shutdown goroutine and the custom volume unmounting goroutine (for backups and images)
-		// and to avoid the situation where a single very long running operation can block the shutdown of unrelated instances and the unmount of unrelated storage volumes.
+		// This avoids the situation where a single very long running operation can block the shutdown of unrelated instances and the unmount of unrelated storage volumes.
 		for resourceName, resourceEntries := range opAPI.Resources {
 			if resourceName != "instances" {
 				continue
@@ -489,16 +488,9 @@ func operationCancel(ctx context.Context, s *state.State, projectName string, op
 func operationsGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	projectName := request.QueryParam(r, "project")
-	allProjects := shared.IsTrue(request.QueryParam(r, "all-projects"))
-	recursion := util.IsRecursionRequest(r)
-
-	if allProjects && projectName != "" {
-		return response.SmartError(
-			api.StatusErrorf(http.StatusBadRequest, "Cannot specify a project when requesting all projects"),
-		)
-	} else if !allProjects && projectName == "" {
-		projectName = api.ProjectDefaultName
+	projectName, allProjects, err := request.ProjectParams(r)
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	userHasPermission, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanViewOperations, entity.TypeProject)
@@ -567,8 +559,15 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 		return body, nil
 	}
 
+	recursion := util.IsRecursionRequest(r)
+
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	// Check if called from a cluster node.
-	if isClusterNotification(r) {
+	if requestor.IsClusterNotification() {
 		// Only return the local data.
 		if recursion {
 			// Recursive queries.
@@ -919,8 +918,12 @@ func operationWaitGet(d *Daemon, r *http.Request) response.Response {
 
 	secret := r.FormValue("secret")
 
-	reqInfo := request.GetContextInfo(r.Context())
-	trusted := reqInfo != nil && reqInfo.Trusted
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	trusted := requestor.IsTrusted()
 
 	if !trusted && secret == "" {
 		return response.Forbidden(nil)
@@ -1181,7 +1184,7 @@ func autoRemoveOrphanedOperations(ctx context.Context, s *state.State) error {
 
 	offlineThreshold := s.GlobalConfig.OfflineThreshold()
 
-	err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+	err := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		members, err := tx.GetNodes(ctx)
 		if err != nil {
 			return fmt.Errorf("Failed getting cluster members: %w", err)

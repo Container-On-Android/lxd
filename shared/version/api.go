@@ -353,7 +353,6 @@ var APIExtensions = []string{
 	"projects_networks_zones",
 	"network_txqueuelen",
 	"cluster_member_state",
-	"instances_placement_scriptlet",
 	"storage_pool_source_wipe",
 	"zfs_block_mode",
 	"instance_generation_id",
@@ -452,6 +451,17 @@ var APIExtensions = []string{
 	"clustering_restore_skip_mode",
 	"disk_io_threads_virtiofsd",
 	"oidc_client_secret",
+	"pci_hotplug",
+	"device_patch_removal",
+	"auth_secrets",
+	"daemon_storage_per_project",
+	"ovn_internal_load_balancer",
+	"auth_bearer_devlxd",
+	"devlxd_volume_management",
+	"storage_driver_alletra",
+	"resources_disk_used_by",
+	"ovn_dhcp_ranges",
+	"operation_requestor",
 }
 
 // APIExtensionsCount returns the number of available API extensions.

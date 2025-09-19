@@ -17,7 +17,7 @@ import (
 
 	dqlite "github.com/canonical/go-dqlite/v3"
 	"github.com/canonical/go-dqlite/v3/client"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/node"
@@ -144,7 +144,7 @@ func updateLocalAddress(database *db.Node, address string) error {
 			return err
 		}
 
-		newConfig := map[string]any{"cluster.https_address": address}
+		newConfig := map[string]string{"cluster.https_address": address}
 		_, err = config.Patch(newConfig)
 		if err != nil {
 			return err

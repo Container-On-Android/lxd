@@ -1306,6 +1306,13 @@ func (d *ceph) GetVolumeUsage(vol Volume) (int64, error) {
 // SetVolumeQuota applies a size limit on volume.
 // Does nothing if supplied with an empty/zero size.
 func (d *ceph) SetVolumeQuota(vol Volume, size string, allowUnsafeResize bool, op *operations.Operation) error {
+	// Block image volumes cannot be resized because they have a readonly snapshot that doesn't get
+	// updated when the volume's size is changed, and this is what instances are created from.
+	// During initial volume fill allowUnsafeResize is enabled because snapshot hasn't been taken yet.
+	if !allowUnsafeResize && vol.volType == VolumeTypeImage {
+		return ErrNotSupported
+	}
+
 	// Convert to bytes.
 	sizeBytes, err := units.ParseByteSizeString(size)
 	if err != nil {
@@ -1334,13 +1341,6 @@ func (d *ceph) SetVolumeQuota(vol Volume, size string, allowUnsafeResize bool, o
 	// Do nothing if volume is already specified size (+/- 512 bytes).
 	if oldSizeBytes+512 > sizeBytes && oldSizeBytes-512 < sizeBytes {
 		return nil
-	}
-
-	// Block image volumes cannot be resized because they have a readonly snapshot that doesn't get
-	// updated when the volume's size is changed, and this is what instances are created from.
-	// During initial volume fill allowUnsafeResize is enabled because snapshot hasn't been taken yet.
-	if !allowUnsafeResize && vol.volType == VolumeTypeImage {
-		return ErrNotSupported
 	}
 
 	inUse := vol.MountInUse()
@@ -1520,7 +1520,7 @@ func (d *ceph) ListVolumes() ([]Volume, error) {
 		return nil, fmt.Errorf("Failed getting volume list: %v: %w", strings.TrimSpace(string(errMsg)), err)
 	}
 
-	volList := make([]Volume, len(vols))
+	volList := make([]Volume, 0, len(vols))
 	for _, v := range vols {
 		volList = append(volList, v)
 	}
@@ -1631,7 +1631,7 @@ func (d *ceph) UnmountVolume(vol Volume, keepBlockDev bool, op *operations.Opera
 		}
 
 		ourUnmount = true
-	} else if vol.contentType == ContentTypeBlock {
+	} else if IsContentBlock(vol.contentType) {
 		// For VMs, unmount the filesystem volume.
 		if vol.IsVMBlock() {
 			fsVol := vol.NewVMBlockFilesystemVolume()
@@ -1871,7 +1871,7 @@ func (d *ceph) MigrateVolume(vol VolumeCopy, conn io.ReadWriteCloser, volSrcArgs
 }
 
 // BackupVolume creates an exported version of a volume.
-func (d *ceph) BackupVolume(vol VolumeCopy, tarWriter *instancewriter.InstanceTarWriter, optimized bool, snapshots []string, op *operations.Operation) error {
+func (d *ceph) BackupVolume(vol VolumeCopy, projectName string, tarWriter *instancewriter.InstanceTarWriter, optimized bool, snapshots []string, op *operations.Operation) error {
 	return genericVFSBackupVolume(d, vol, tarWriter, snapshots, op)
 }
 
@@ -2041,8 +2041,11 @@ func (d *ceph) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) err
 
 		RBDFilesystem := snapVol.ConfigBlockFilesystem()
 		mountFlags, mountOptions := filesystem.ResolveMountOptions(strings.Split(snapVol.ConfigBlockMountOptions(), ","))
+		mountOptions = addNoRecoveryMountOption(mountOptions, RBDFilesystem)
 
 		if renegerateFilesystemUUIDNeeded(RBDFilesystem) {
+			// When mounting XFS filesystems temporarily we can use the nouuid option rather than fully
+			// regenerating the filesystem UUID.
 			if RBDFilesystem == "xfs" {
 				idx := strings.Index(mountOptions, "nouuid")
 				if idx < 0 {

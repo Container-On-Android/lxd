@@ -9,9 +9,9 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/canonical/lxd/lxd/config"
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/db/cluster"
-	"github.com/canonical/lxd/lxd/node"
 	"github.com/canonical/lxd/lxd/project"
 	"github.com/canonical/lxd/lxd/rsync"
 	"github.com/canonical/lxd/lxd/state"
@@ -19,63 +19,62 @@ import (
 	storageDrivers "github.com/canonical/lxd/lxd/storage/drivers"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
+	"github.com/canonical/lxd/shared/revert"
 )
 
-func daemonStorageVolumesUnmount(s *state.State, ctx context.Context) error {
-	var storageBackups string
-	var storageImages string
-
-	err := s.DB.Node.Transaction(ctx, func(ctx context.Context, tx *db.NodeTx) error {
-		nodeConfig, err := node.ConfigLoad(ctx, tx)
-		if err != nil {
-			return err
-		}
-
-		storageBackups = nodeConfig.StorageBackupsVolume()
-		storageImages = nodeConfig.StorageImagesVolume()
-
-		return nil
-	})
+func unmountDaemonStorageVolume(s *state.State, daemonStorageVolume string) error {
+	// Parse the source.
+	poolName, volumeName, err := daemonStorageSplitVolume(daemonStorageVolume)
 	if err != nil {
 		return err
 	}
 
-	unmount := func(source string) error {
-		// Parse the source.
-		poolName, volumeName, err := daemonStorageSplitVolume(source)
-		if err != nil {
-			return err
-		}
-
-		pool, err := storagePools.LoadByName(s, poolName)
-		if err != nil {
-			return err
-		}
-
-		// Unmount volume.
-		_, err = pool.UnmountCustomVolume(api.ProjectDefaultName, volumeName, nil)
-		if err != nil && !errors.Is(err, storageDrivers.ErrInUse) {
-			return fmt.Errorf("Failed to unmount storage volume %q: %w", source, err)
-		}
-
-		return nil
+	pool, err := storagePools.LoadByName(s, poolName)
+	if err != nil {
+		return err
 	}
+
+	// Unmount volume.
+	_, err = pool.UnmountCustomVolume(api.ProjectDefaultName, volumeName, nil)
+	if err != nil && !errors.Is(err, storageDrivers.ErrInUse) {
+		return fmt.Errorf("Failed to unmount storage volume %q: %w", daemonStorageVolume, err)
+	}
+
+	return nil
+}
+
+func daemonStorageVolumesUnmount(s *state.State, ctx context.Context) error {
+	storageBackups := s.LocalConfig.StorageBackupsVolume("")
+	storageImages := s.LocalConfig.StorageImagesVolume("")
 
 	select {
 	case <-ctx.Done():
 		return errors.New("Timed out waiting for image and backup volume")
 	default:
 		if storageBackups != "" {
-			err := unmount(storageBackups)
+			err := unmountDaemonStorageVolume(s, storageBackups)
 			if err != nil {
 				return fmt.Errorf("Failed to unmount backups storage: %w", err)
 			}
 		}
 
 		if storageImages != "" {
-			err := unmount(storageImages)
+			err := unmountDaemonStorageVolume(s, storageImages)
 			if err != nil {
 				return fmt.Errorf("Failed to unmount images storage: %w", err)
+			}
+		}
+
+		for key, value := range s.LocalConfig.Dump() {
+			// Look for all the project storage volumes.
+			projectName, _ := config.ParseDaemonStorageConfigKey(key)
+			if projectName == "" {
+				continue
+			}
+
+			err := unmountDaemonStorageVolume(s, value)
+			if err != nil {
+				return fmt.Errorf("Failed to unmount project storage volume %q set under node config key %q: %w", value, key, err)
 			}
 		}
 	}
@@ -83,56 +82,122 @@ func daemonStorageVolumesUnmount(s *state.State, ctx context.Context) error {
 	return nil
 }
 
-func daemonStorageMount(s *state.State) error {
-	var storageBackups string
-	var storageImages string
-	err := s.DB.Node.Transaction(context.Background(), func(ctx context.Context, tx *db.NodeTx) error {
-		nodeConfig, err := node.ConfigLoad(ctx, tx)
-		if err != nil {
-			return err
-		}
-
-		storageBackups = nodeConfig.StorageBackupsVolume()
-		storageImages = nodeConfig.StorageImagesVolume()
-
-		return nil
-	})
+func mountDaemonStorageVolume(s *state.State, daemonStorageVolume string) error {
+	// Parse the source.
+	poolName, volumeName, err := daemonStorageSplitVolume(daemonStorageVolume)
 	if err != nil {
 		return err
 	}
 
-	mount := func(source string) error {
-		// Parse the source.
-		poolName, volumeName, err := daemonStorageSplitVolume(source)
-		if err != nil {
-			return err
-		}
-
-		pool, err := storagePools.LoadByName(s, poolName)
-		if err != nil {
-			return err
-		}
-
-		// Mount volume.
-		_, err = pool.MountCustomVolume(api.ProjectDefaultName, volumeName, nil)
-		if err != nil {
-			return fmt.Errorf("Failed to mount storage volume %q: %w", source, err)
-		}
-
-		return nil
+	pool, err := storagePools.LoadByName(s, poolName)
+	if err != nil {
+		return err
 	}
 
+	// Mount volume.
+	_, err = pool.MountCustomVolume(api.ProjectDefaultName, volumeName, nil)
+	if err != nil {
+		return fmt.Errorf("Failed to mount storage volume %q: %w", daemonStorageVolume, err)
+	}
+
+	return nil
+}
+
+func daemonStorageMount(s *state.State) error {
+	storageBackups := s.LocalConfig.StorageBackupsVolume("")
+	storageImages := s.LocalConfig.StorageImagesVolume("")
+
 	if storageBackups != "" {
-		err := mount(storageBackups)
+		err := mountDaemonStorageVolume(s, storageBackups)
 		if err != nil {
 			return fmt.Errorf("Failed to mount backups storage: %w", err)
 		}
 	}
 
 	if storageImages != "" {
-		err := mount(storageImages)
+		err := mountDaemonStorageVolume(s, storageImages)
 		if err != nil {
 			return fmt.Errorf("Failed to mount images storage: %w", err)
+		}
+	}
+
+	for key, value := range s.LocalConfig.Dump() {
+		// Look for all the project storage volumes.
+		projectName, _ := config.ParseDaemonStorageConfigKey(key)
+		if projectName == "" {
+			continue
+		}
+
+		err := mountDaemonStorageVolume(s, value)
+		if err != nil {
+			return fmt.Errorf("Failed to mount project storage volume %q set under node config key %q: %w", value, key, err)
+		}
+	}
+
+	return nil
+}
+
+// Mount the volume specified by `daemonStorageVolume` (in the form of pool/volume)
+// and create the necessary directory structure to use it as a `storageType` (either `images` or `backups`) storage.
+func projectStorageVolumeSetup(s *state.State, daemonStorageVolume string, storageType config.DaemonStorageType) error {
+	revert := revert.New()
+	defer revert.Fail()
+
+	err := mountDaemonStorageVolume(s, daemonStorageVolume)
+	if err != nil {
+		return fmt.Errorf("Failed to setup project %s storage: %w", storageType, err)
+	}
+
+	revert.Add(func() { _ = unmountDaemonStorageVolume(s, daemonStorageVolume) })
+
+	// Ensure the destination directory structure exists within the target volume.
+	path := daemonStoragePath(daemonStorageVolume, storageType)
+	fileinfo, err := os.Stat(path)
+	if err == nil {
+		if !fileinfo.IsDir() {
+			return fmt.Errorf("Cannot create directory, file already exists: %q", path)
+		}
+	} else if errors.Is(err, os.ErrNotExist) {
+		err = os.Mkdir(path, 0700)
+		if err != nil {
+			return fmt.Errorf("Failed to create directory %q: %w", path, err)
+		}
+
+		revert.Add(func() { os.Remove(path) })
+	} else {
+		return fmt.Errorf("Failed to stat() file %q: %w", path, err)
+	}
+
+	// Set ownership & mode.
+	err = os.Chmod(path, 0700)
+	if err != nil {
+		return fmt.Errorf("Failed to set permissions on %q: %w", path, err)
+	}
+
+	err = os.Chown(path, 0, 0)
+	if err != nil {
+		return fmt.Errorf("Failed to set ownership on %q: %w", path, err)
+	}
+
+	revert.Success()
+	return nil
+}
+
+// projectStorageVolumeChange handles changes of one of the storage.images_volume or storage.backups.volume configs.
+// As these configs can be changed only on empty projects, we don't move any images around. Instead we only
+// mount the volumes as needed.
+func projectStorageVolumeChange(s *state.State, oldConfig string, newConfig string, storageType config.DaemonStorageType) error {
+	if oldConfig != "" {
+		err := unmountDaemonStorageVolume(s, oldConfig)
+		if err != nil {
+			return fmt.Errorf("Failed to unmount images storage: %w", err)
+		}
+	}
+
+	if newConfig != "" {
+		err := projectStorageVolumeSetup(s, newConfig, storageType)
+		if err != nil {
+			return fmt.Errorf("Failed to setup project %s storage: %w", storageType, err)
 		}
 	}
 
@@ -146,14 +211,14 @@ func daemonStorageSplitVolume(volume string) (poolName string, volumeName string
 
 	poolName, volumeName, _ = strings.Cut(volume, "/")
 
-	// Validate pool name.
-	if strings.Contains(poolName, "\\") || strings.Contains(poolName, "..") {
-		return "", "", fmt.Errorf("Invalid pool name: %q", poolName)
+	err = storageDrivers.ValidPoolName(poolName)
+	if err != nil {
+		return "", "", fmt.Errorf("Invalid pool name %q: %w", poolName, err)
 	}
 
-	// Validate volume name.
-	if strings.Contains(volumeName, "\\") || strings.Contains(volumeName, "..") {
-		return "", "", fmt.Errorf("Invalid volume name: %q", volumeName)
+	err = storageDrivers.ValidVolumeName(volumeName)
+	if err != nil {
+		return "", "", fmt.Errorf("Invalid volume name %q: %w", volumeName, err)
 	}
 
 	return poolName, volumeName, nil
@@ -255,8 +320,22 @@ func daemonStorageValidate(s *state.State, target string) (validatedTarget strin
 	return pool.Name() + "/" + dbVol.Name, nil
 }
 
-func daemonStorageMove(s *state.State, storageType string, oldConfig string, newconfig string) error {
-	destPath := shared.VarPath(storageType)
+// daemonStoragePath returns the full path for a daemon storage located on the specific volume.
+// The `storageType` is either `images`, or `backups`.
+// The `daemonStorageVolume` is the specific volume in the form of "pool/volume".
+func daemonStoragePath(daemonStorageVolume string, storageType config.DaemonStorageType) string {
+	if daemonStorageVolume == "" {
+		return shared.VarPath(string(storageType))
+	}
+
+	poolName, volumeName, _ := daemonStorageSplitVolume(daemonStorageVolume)
+	volStorageName := project.StorageVolume(api.ProjectDefaultName, volumeName)
+	volMountPath := storageDrivers.GetVolumeMountPath(poolName, storageDrivers.VolumeTypeCustom, volStorageName)
+	return filepath.Join(volMountPath, string(storageType))
+}
+
+func daemonStorageMove(s *state.State, storageType config.DaemonStorageType, oldConfig string, newconfig string) error {
+	destPath := shared.VarPath(string(storageType))
 	var sourcePath string
 	var sourcePool string
 	var sourceVolume string
@@ -274,7 +353,7 @@ func daemonStorageMove(s *state.State, storageType string, oldConfig string, new
 
 		sourceVolume = project.StorageVolume(api.ProjectDefaultName, sourceVolume)
 		sourcePath = storageDrivers.GetVolumeMountPath(sourcePool, storageDrivers.VolumeTypeCustom, sourceVolume)
-		sourcePath = filepath.Join(sourcePath, storageType)
+		sourcePath = filepath.Join(sourcePath, string(storageType))
 	}
 
 	moveContent := func(source string, target string) error {
@@ -338,20 +417,14 @@ func daemonStorageMove(s *state.State, storageType string, oldConfig string, new
 		return fmt.Errorf("Failed to mount storage volume %q: %w", newconfig, err)
 	}
 
-	// Set ownership & mode.
-	switch storageType {
-	case "images":
-		destPath = s.ImagesStoragePath()
-	case "backups":
-		destPath = s.BackupsStoragePath()
-	}
-
 	// Ensure the destination directory structure exists within the target volume.
+	destPath = daemonStoragePath(newconfig, storageType)
 	err = os.MkdirAll(destPath, 0700)
 	if err != nil {
 		return fmt.Errorf("Failed to create directory %q: %w", destPath, err)
 	}
 
+	// Set ownership & mode.
 	err = os.Chmod(destPath, 0700)
 	if err != nil {
 		return fmt.Errorf("Failed to set permissions on %q: %w", destPath, err)
@@ -363,7 +436,7 @@ func daemonStorageMove(s *state.State, storageType string, oldConfig string, new
 	}
 
 	// Handle changes.
-	if sourcePath != shared.VarPath(storageType) {
+	if sourcePath != shared.VarPath(string(storageType)) {
 		// Move the data across.
 		err = moveContent(sourcePath, destPath)
 		if err != nil {

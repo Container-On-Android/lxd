@@ -116,7 +116,7 @@
 					{
 						"path": {
 							"condition": "container",
-							"longdesc": "This option specifies the path inside the container where the disk will be mounted.",
+							"longdesc": "This option specifies the path inside the container where the disk will be mounted.\nFor containers, this option allows mounting filesystem disk devices, as well as specific paths and individual files within those devices.\nFor VMs, this option allows mounting filesystem disk devices and paths within them. Mounting individual files is not supported.",
 							"required": "yes",
 							"shortdesc": "Mount path",
 							"type": "string"
@@ -1941,7 +1941,7 @@
 					{
 						"boot.autostart": {
 							"liveupdate": "no",
-							"longdesc": "If set to `false`, restore the last state.",
+							"longdesc": "If set to `true`, the instance will always be auto-started, unless `security.protection.start` is also enabled.\nIf set to `false`, the instance will not be started on LXD start up.\nIf this option is not set, the instance will be restored to its last known state.",
 							"shortdesc": "Whether to always start the instance when LXD starts",
 							"type": "bool"
 						}
@@ -2160,7 +2160,7 @@
 					{
 						"ubuntu_pro.guest_attach": {
 							"liveupdate": "no",
-							"longdesc": "Indicate whether the guest should auto-attach Ubuntu Pro at start up.\n\nSee {ref}`ubuntu-pro-guest-attach` for more information.",
+							"longdesc": "Indicate whether the guest should auto-attach Ubuntu Pro at start up.\n\nSee {ref}`instances-ubuntu-pro-attach` for more information.",
 							"shortdesc": "Whether to auto-attach Ubuntu Pro.",
 							"type": "string"
 						}
@@ -2520,6 +2520,15 @@
 						}
 					},
 					{
+						"security.devlxd.management.volumes": {
+							"defaultdesc": "`false`",
+							"liveupdate": "yes",
+							"longdesc": "",
+							"shortdesc": "Controls the availability of the volume management API over `devlxd`",
+							"type": "bool"
+						}
+					},
+					{
 						"security.idmap.base": {
 							"condition": "unprivileged container",
 							"liveupdate": "no",
@@ -2835,6 +2844,13 @@
 						"volatile.\u003cname\u003e.ceph_rbd": {
 							"longdesc": "",
 							"shortdesc": "RBD device path for Ceph disk devices",
+							"type": "string"
+						}
+					},
+					{
+						"volatile.\u003cname\u003e.devlxd.owner": {
+							"longdesc": "ID of the DevLXD identity that owns the device. It is used by DevLXD to restrict\naccess of an identity to devices that were created by that identity.",
+							"shortdesc": "DevLXD identity ID that owns the device.",
 							"type": "string"
 						}
 					},
@@ -4067,6 +4083,16 @@
 						}
 					},
 					{
+						"ipv4.dhcp.ranges": {
+							"condition": "IPv4 DHCP",
+							"defaultdesc": "all addresses",
+							"longdesc": "Specify a comma-separated list of IPv4 ranges in FIRST-LAST format.",
+							"scope": "global",
+							"shortdesc": "IPv4 ranges to use for DHCP",
+							"type": "string"
+						}
+					},
+					{
 						"ipv4.l3only": {
 							"condition": "IPv4 address",
 							"defaultdesc": "`false`",
@@ -5111,6 +5137,15 @@
 			"core": {
 				"keys": [
 					{
+						"core.auth_secret_expiry": {
+							"defaultdesc": "`1m`",
+							"longdesc": "The secret is used for various cryptographic purposes, such as cookie encryption.\nWhen a given secret is older than the configured expiry, a new secret is generated.\n\nThis configuration option accepts multiple space-separated values of the form `[0-9]+(S|M|H|d|w|m|y)`,\nwhere `S` is seconds, `M` is minutes, `H` is hours, `d` is days, `w` is weeks, `m` is months, and `y` is years.\nFor example, `1d 3H` is 1 day and 3 hours.\n\nThe default value is `1m` (1 month).\nThe minimum value is `1d` (1 day).",
+							"scope": "global",
+							"shortdesc": "How long to use a given cluster secret",
+							"type": "string"
+						}
+					},
+					{
 						"core.bgp_address": {
 							"longdesc": "See {ref}`network-bgp`.",
 							"scope": "local",
@@ -5193,9 +5228,9 @@
 					},
 					{
 						"core.https_trusted_proxy": {
-							"longdesc": "Specify a comma-separated list of IP addresses of trusted servers that provide the client's address through the proxy connection header.",
+							"longdesc": "Specify a comma-separated list of IP addresses of trusted servers that provide the client's address through the PROXY protocol connection header.",
 							"scope": "global",
-							"shortdesc": "Trusted servers to provide the client's address",
+							"shortdesc": "Trusted servers to provide the client's address via the PROXY protocol",
 							"type": "string"
 						}
 					},
@@ -5433,14 +5468,6 @@
 						}
 					},
 					{
-						"instances.placement.scriptlet": {
-							"longdesc": "When using custom automatic instance placement logic, this option stores the scriptlet.\nSee {ref}`clustering-instance-placement-scriptlet` for more information.",
-							"scope": "global",
-							"shortdesc": "Instance placement scriptlet for automatic instance placement",
-							"type": "string"
-						}
-					},
-					{
 						"maas.api.key": {
 							"longdesc": "",
 							"scope": "global",
@@ -5525,6 +5552,38 @@
 							"shortdesc": "Volume to use to store the image tarballs",
 							"type": "string"
 						}
+					},
+					{
+						"storage.project.{name}.backups_volume": {
+							"longdesc": "Specify the volume using the syntax `POOL/VOLUME`.",
+							"scope": "local",
+							"shortdesc": "Volume to use to store project-specific backup tarballs",
+							"type": "string"
+						}
+					},
+					{
+						"storage.project.{name}.images_volume": {
+							"longdesc": "Specify the volume using the syntax `POOL/VOLUME`.",
+							"scope": "local",
+							"shortdesc": "Volume to use to store project-specific image tarballs",
+							"type": "string"
+						}
+					},
+					{
+						"user.instances.placement.scriptlet": {
+							"longdesc": "Stores the migrated value from the deprecated `instances.placement.scriptlet` configuration key. LXD ignores this key; changing it has no effect. It exists only to preserve previously stored data and may be removed in a future release.\n",
+							"scope": "global",
+							"shortdesc": "Legacy storage for `instances.placement.scriptlet` (no effect)",
+							"type": "string"
+						}
+					},
+					{
+						"volatile.uuid": {
+							"longdesc": "This UUID is used as a stable identifier for the cluster. It cannot be changed.",
+							"scope": "global",
+							"shortdesc": "A random v7 UUID",
+							"type": "string"
+						}
 					}
 				]
 			},
@@ -5576,6 +5635,214 @@
 							"scope": "global",
 							"shortdesc": "Space-separated list of OpenID Connect scopes",
 							"type": "space-delimited string"
+						}
+					}
+				]
+			}
+		},
+		"storage-alletra": {
+			"pool-conf": {
+				"keys": [
+					{
+						"alletra.cpg": {
+							"longdesc": "",
+							"shortdesc": "HPE Alletra Common Provisioning Group (CPG) name",
+							"type": "string"
+						}
+					},
+					{
+						"alletra.mode": {
+							"defaultdesc": "the discovered mode",
+							"longdesc": "The mode to use to map storage volumes to the local server.\nSupported values are `iscsi` and `nvme`.",
+							"shortdesc": "How volumes are mapped to the local server",
+							"type": "string"
+						}
+					},
+					{
+						"alletra.target": {
+							"defaultdesc": "the discovered mode",
+							"longdesc": "A comma-separated list of target addresses. If empty, LXD discovers and connects to all available targets. Otherwise, it only connects to the specified addresses.",
+							"shortdesc": "List of target addresses.",
+							"type": "string"
+						}
+					},
+					{
+						"alletra.user.name": {
+							"longdesc": "",
+							"shortdesc": "HPE Alletra storage admin username",
+							"type": "string"
+						}
+					},
+					{
+						"alletra.user.password": {
+							"longdesc": "",
+							"shortdesc": "HPE Alletra storage admin password",
+							"type": "string"
+						}
+					},
+					{
+						"alletra.wsapi": {
+							"longdesc": "",
+							"shortdesc": "Address of the HPE Alletra Storage UI/WSAPI",
+							"type": "string"
+						}
+					},
+					{
+						"alletra.wsapi.verify": {
+							"defaultdesc": "`true`",
+							"longdesc": "",
+							"shortdesc": "Whether to verify the HPE Alletra Storage UI/WSAPI certificate",
+							"type": "bool"
+						}
+					},
+					{
+						"rsync.bwlimit": {
+							"defaultdesc": "`0` (no limit)",
+							"longdesc": "When `rsync` must be used to transfer storage entities, this option specifies the upper limit\nto be placed on the socket I/O.",
+							"scope": "global",
+							"shortdesc": "Upper limit on the socket I/O for `rsync`",
+							"type": "string"
+						}
+					},
+					{
+						"rsync.compression": {
+							"defaultdesc": "`true`",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "Whether to use compression while migrating storage pools",
+							"type": "bool"
+						}
+					},
+					{
+						"volume.size": {
+							"defaultdesc": "`10GiB`",
+							"longdesc": "Default storage volume size rounded to 256MiB. The minimum size is 256MiB.",
+							"shortdesc": "Size/quota of the storage volume",
+							"type": "string"
+						}
+					}
+				]
+			},
+			"volume-conf": {
+				"keys": [
+					{
+						"block.filesystem": {
+							"condition": "block-based volume with content type `filesystem`",
+							"defaultdesc": "same as `volume.block.filesystem`",
+							"longdesc": "Valid options are: `btrfs`, `ext4`, `xfs`\nIf not set, `ext4` is assumed.",
+							"shortdesc": "File system of the storage volume",
+							"type": "string"
+						}
+					},
+					{
+						"block.mount_options": {
+							"condition": "block-based volume with content type `filesystem`",
+							"defaultdesc": "same as `volume.block.mount_options`",
+							"longdesc": "",
+							"shortdesc": "Mount options for block-backed file system volumes",
+							"type": "string"
+						}
+					},
+					{
+						"security.shared": {
+							"condition": "virtual-machine or custom block volume",
+							"defaultdesc": "same as `volume.security.shared` or `false`",
+							"longdesc": "Enabling this option allows sharing the volume across multiple instances despite the possibility of data loss.\n",
+							"scope": "global",
+							"shortdesc": "Enable volume sharing",
+							"type": "bool"
+						}
+					},
+					{
+						"security.shifted": {
+							"condition": "custom volume",
+							"defaultdesc": "same as `volume.security.shifted` or `false`",
+							"longdesc": "Enabling this option allows attaching the volume to multiple isolated instances.",
+							"scope": "global",
+							"shortdesc": "Enable ID shifting overlay",
+							"type": "bool"
+						}
+					},
+					{
+						"security.unmapped": {
+							"condition": "custom volume",
+							"defaultdesc": "same as `volume.security.unmappped` or `false`",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "Disable ID mapping for the volume",
+							"type": "bool"
+						}
+					},
+					{
+						"size": {
+							"defaultdesc": "`10GiB`",
+							"longdesc": "Default storage volume size rounded to 256MiB. The minimum size is 256MiB.",
+							"shortdesc": "Size/quota of the storage volume",
+							"type": "string"
+						}
+					},
+					{
+						"snapshots.expiry": {
+							"condition": "custom volume",
+							"defaultdesc": "same as `volume.snapshots.expiry`",
+							"longdesc": "Specify an expression like `1M 2H 3d 4w 5m 6y`.",
+							"scope": "global",
+							"shortdesc": "When snapshots are to be deleted",
+							"type": "string"
+						}
+					},
+					{
+						"snapshots.pattern": {
+							"condition": "custom volume",
+							"defaultdesc": "same as `volume.snapshots.pattern` or `snap%d`",
+							"longdesc": "You can specify a naming template that is used for scheduled snapshots and unnamed snapshots.\n\nThe `snapshots.pattern` option takes a Pongo2 template string to format the snapshot name.\n\nTo add a time stamp to the snapshot name, use the Pongo2 context variable `creation_date`.\nMake sure to format the date in your template string to avoid forbidden characters in the snapshot name.\nFor example, set `snapshots.pattern` to `{{ creation_date|date:'2006-01-02_15-04-05' }}` to name the snapshots after their time of creation, down to the precision of a second.\n\nAnother way to avoid name collisions is to use the placeholder `%d` in the pattern.\nFor the first snapshot, the placeholder is replaced with `0`.\nFor subsequent snapshots, the existing snapshot names are taken into account to find the highest number at the placeholder's position.\nThis number is then incremented by one for the new name.",
+							"scope": "global",
+							"shortdesc": "Template for the snapshot name",
+							"type": "string"
+						}
+					},
+					{
+						"snapshots.schedule": {
+							"condition": "custom volume",
+							"defaultdesc": "same as `snapshots.schedule`",
+							"longdesc": "Specify either a cron expression (`\u003cminute\u003e \u003chour\u003e \u003cdom\u003e \u003cmonth\u003e \u003cdow\u003e`), a comma-separated list of schedule aliases (`@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@annually`, `@yearly`), or leave empty to disable automatic snapshots (the default).",
+							"scope": "global",
+							"shortdesc": "Schedule for automatic volume snapshots",
+							"type": "string"
+						}
+					},
+					{
+						"volatile.devlxd.owner": {
+							"defaultdesc": "DevLXD owner identity ID",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "The ID of the DevLXD identity which owns the volume",
+							"type": "string"
+						}
+					},
+					{
+						"volatile.idmap.last": {
+							"condition": "filesystem",
+							"longdesc": "",
+							"shortdesc": "JSON-serialized UID/GID map that has been applied to the volume",
+							"type": "string"
+						}
+					},
+					{
+						"volatile.idmap.next": {
+							"condition": "filesystem",
+							"longdesc": "",
+							"shortdesc": "JSON-serialized UID/GID map that has been applied to the volume",
+							"type": "string"
+						}
+					},
+					{
+						"volatile.uuid": {
+							"defaultdesc": "random UUID",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "The volume's UUID",
+							"type": "string"
 						}
 					}
 				]
@@ -5704,6 +5971,15 @@
 							"longdesc": "Specify either a cron expression (`\u003cminute\u003e \u003chour\u003e \u003cdom\u003e \u003cmonth\u003e \u003cdow\u003e`), a comma-separated list of schedule aliases (`@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@annually`, `@yearly`), or leave empty to disable automatic snapshots (the default).",
 							"scope": "global",
 							"shortdesc": "Schedule for automatic volume snapshots",
+							"type": "string"
+						}
+					},
+					{
+						"volatile.devlxd.owner": {
+							"defaultdesc": "DevLXD owner identity ID",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "The ID of the DevLXD identity which owns the volume",
 							"type": "string"
 						}
 					},
@@ -5929,6 +6205,15 @@
 						}
 					},
 					{
+						"volatile.devlxd.owner": {
+							"defaultdesc": "DevLXD owner identity ID",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "The ID of the DevLXD identity which owns the volume",
+							"type": "string"
+						}
+					},
+					{
 						"volatile.idmap.last": {
 							"condition": "filesystem",
 							"longdesc": "",
@@ -6114,6 +6399,15 @@
 							"longdesc": "Specify either a cron expression (`\u003cminute\u003e \u003chour\u003e \u003cdom\u003e \u003cmonth\u003e \u003cdow\u003e`), a comma-separated list of schedule aliases (`@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@annually`, `@yearly`), or leave empty to disable automatic snapshots (the default).",
 							"scope": "global",
 							"shortdesc": "Schedule for automatic volume snapshots",
+							"type": "string"
+						}
+					},
+					{
+						"volatile.devlxd.owner": {
+							"defaultdesc": "DevLXD owner identity ID",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "The ID of the DevLXD identity which owns the volume",
 							"type": "string"
 						}
 					},
@@ -6313,6 +6607,15 @@
 							"longdesc": "Specify either a cron expression (`\u003cminute\u003e \u003chour\u003e \u003cdom\u003e \u003cmonth\u003e \u003cdow\u003e`), a comma-separated list of schedule aliases (`@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@annually`, `@yearly`), or leave empty to disable automatic snapshots (the default).",
 							"scope": "global",
 							"shortdesc": "Schedule for automatic volume snapshots",
+							"type": "string"
+						}
+					},
+					{
+						"volatile.devlxd.owner": {
+							"defaultdesc": "DevLXD owner identity ID",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "The ID of the DevLXD identity which owns the volume",
 							"type": "string"
 						}
 					},
@@ -6563,6 +6866,15 @@
 						}
 					},
 					{
+						"volatile.devlxd.owner": {
+							"defaultdesc": "DevLXD owner identity ID",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "The ID of the DevLXD identity which owns the volume",
+							"type": "string"
+						}
+					},
+					{
 						"volatile.idmap.last": {
 							"condition": "filesystem",
 							"longdesc": "",
@@ -6593,15 +6905,6 @@
 		"storage-powerflex": {
 			"pool-conf": {
 				"keys": [
-					{
-						"powerflex.clone_copy": {
-							"defaultdesc": "`true`",
-							"longdesc": "If this option is set to `true`, PowerFlex makes a non-sparse copy when creating a snapshot of an instance or custom volume.\nSee {ref}`storage-powerflex-limitations` for more information.",
-							"scope": "global",
-							"shortdesc": "Whether to use non-sparse copies for snapshots",
-							"type": "bool"
-						}
-					},
 					{
 						"powerflex.domain": {
 							"longdesc": "This option is required only if {config:option}`storage-powerflex-pool-conf:powerflex.pool` is specified using its name.",
@@ -6650,6 +6953,15 @@
 							"scope": "global",
 							"shortdesc": "Comma separated list of PowerFlex NVMe/TCP SDTs",
 							"type": "string"
+						}
+					},
+					{
+						"powerflex.snapshot_copy": {
+							"defaultdesc": "`false`",
+							"longdesc": "If this option is set to `true`, PowerFlex makes a sparse snapshot when copying an instance or custom volume.\nSee {ref}`storage-powerflex-limitations` for more information.",
+							"scope": "global",
+							"shortdesc": "Whether to use sparse snapshots for copies",
+							"type": "bool"
 						}
 					},
 					{
@@ -6799,6 +7111,15 @@
 						}
 					},
 					{
+						"volatile.devlxd.owner": {
+							"defaultdesc": "DevLXD owner identity ID",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "The ID of the DevLXD identity which owns the volume",
+							"type": "string"
+						}
+					},
+					{
 						"volatile.idmap.last": {
 							"condition": "filesystem",
 							"longdesc": "",
@@ -6868,6 +7189,24 @@
 						}
 					},
 					{
+						"rsync.bwlimit": {
+							"defaultdesc": "`0` (no limit)",
+							"longdesc": "When `rsync` must be used to transfer storage entities, this option specifies the upper limit\nto be placed on the socket I/O.",
+							"scope": "global",
+							"shortdesc": "Upper limit on the socket I/O for `rsync`",
+							"type": "string"
+						}
+					},
+					{
+						"rsync.compression": {
+							"defaultdesc": "`true`",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "Whether to use compression while migrating storage pools",
+							"type": "bool"
+						}
+					},
+					{
 						"volume.size": {
 							"defaultdesc": "`10GiB`",
 							"longdesc": "Default Pure Storage volume size rounded to 512B. The minimum size is 1MiB.",
@@ -6895,6 +7234,36 @@
 							"longdesc": "",
 							"shortdesc": "Mount options for block-backed file system volumes",
 							"type": "string"
+						}
+					},
+					{
+						"security.shared": {
+							"condition": "virtual-machine or custom block volume",
+							"defaultdesc": "same as `volume.security.shared` or `false`",
+							"longdesc": "Enabling this option allows sharing the volume across multiple instances despite the possibility of data loss.\n",
+							"scope": "global",
+							"shortdesc": "Enable volume sharing",
+							"type": "bool"
+						}
+					},
+					{
+						"security.shifted": {
+							"condition": "custom volume",
+							"defaultdesc": "same as `volume.security.shifted` or `false`",
+							"longdesc": "Enabling this option allows attaching the volume to multiple isolated instances.",
+							"scope": "global",
+							"shortdesc": "Enable ID shifting overlay",
+							"type": "bool"
+						}
+					},
+					{
+						"security.unmapped": {
+							"condition": "custom volume",
+							"defaultdesc": "same as `volume.security.unmappped` or `false`",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "Disable ID mapping for the volume",
+							"type": "bool"
 						}
 					},
 					{
@@ -6932,6 +7301,31 @@
 							"longdesc": "Specify either a cron expression (`\u003cminute\u003e \u003chour\u003e \u003cdom\u003e \u003cmonth\u003e \u003cdow\u003e`), a comma-separated list of schedule aliases (`@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@annually`, `@yearly`), or leave empty to disable automatic snapshots (the default).",
 							"scope": "global",
 							"shortdesc": "Schedule for automatic volume snapshots",
+							"type": "string"
+						}
+					},
+					{
+						"volatile.devlxd.owner": {
+							"defaultdesc": "DevLXD owner identity ID",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "The ID of the DevLXD identity which owns the volume",
+							"type": "string"
+						}
+					},
+					{
+						"volatile.idmap.last": {
+							"condition": "filesystem",
+							"longdesc": "",
+							"shortdesc": "JSON-serialized UID/GID map that has been applied to the volume",
+							"type": "string"
+						}
+					},
+					{
+						"volatile.idmap.next": {
+							"condition": "filesystem",
+							"longdesc": "",
+							"shortdesc": "JSON-serialized UID/GID map that has been applied to the volume",
 							"type": "string"
 						}
 					},
@@ -7108,6 +7502,15 @@
 							"longdesc": "Specify either a cron expression (`\u003cminute\u003e \u003chour\u003e \u003cdom\u003e \u003cmonth\u003e \u003cdow\u003e`), a comma-separated list of schedule aliases (`@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@annually`, `@yearly`), or leave empty to disable automatic snapshots (the default).",
 							"scope": "global",
 							"shortdesc": "Schedule for automatic volume snapshots",
+							"type": "string"
+						}
+					},
+					{
+						"volatile.devlxd.owner": {
+							"defaultdesc": "DevLXD owner identity ID",
+							"longdesc": "",
+							"scope": "global",
+							"shortdesc": "The ID of the DevLXD identity which owns the volume",
 							"type": "string"
 						}
 					},
@@ -7632,7 +8035,7 @@
 				},
 				{
 					"name": "can_view_events",
-					"description": "Grants permission to view events relating to the project."
+					"description": "Grants permission to view life cycle events relating to the project."
 				},
 				{
 					"name": "can_view_metrics",
@@ -7729,7 +8132,7 @@
 				},
 				{
 					"name": "project_manager",
-					"description": "Grants permission to view, create, edit, and delete projects, and to create, edit, and delete any resources that are owned by those projects."
+					"description": "Grants permission to create, view, edit, and delete projects, and to create, view, edit, and delete resources belonging to any project."
 				},
 				{
 					"name": "can_create_projects",
@@ -7752,8 +8155,12 @@
 					"description": "If a project is configured with `restricted.cluster.target`, clients with this permission can override the restriction."
 				},
 				{
-					"name": "can_view_privileged_events",
-					"description": "Grants permission to view privileged event types, such as logging events."
+					"name": "can_view_events",
+					"description": "Grants permission to view `logging` events, `ovn` events, and all `lifecycle` events that are not specific to a project."
+				},
+				{
+					"name": "can_view_operations",
+					"description": "Grants permission to view operations that are not specific to a project."
 				},
 				{
 					"name": "can_view_resources",

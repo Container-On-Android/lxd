@@ -207,22 +207,6 @@ func GetProjects(ctx context.Context, tx *sql.Tx, filters ...ProjectFilter) ([]P
 	return objects, nil
 }
 
-// GetProjectConfig returns all available Project Config
-// generator: project GetMany
-func GetProjectConfig(ctx context.Context, tx *sql.Tx, projectID int, filters ...ConfigFilter) (map[string]string, error) {
-	projectConfig, err := GetConfig(ctx, tx, "project", filters...)
-	if err != nil {
-		return nil, err
-	}
-
-	config, ok := projectConfig[projectID]
-	if !ok {
-		config = map[string]string{}
-	}
-
-	return config, nil
-}
-
 // GetProject returns the project with the given key.
 // generator: project GetOne
 func GetProject(ctx context.Context, tx *sql.Tx, name string) (*Project, error) {
@@ -244,34 +228,9 @@ func GetProject(ctx context.Context, tx *sql.Tx, name string) (*Project, error) 
 	}
 }
 
-// ProjectExists checks if a project with the given key exists.
-// generator: project Exists
-func ProjectExists(ctx context.Context, tx *sql.Tx, name string) (bool, error) {
-	_, err := GetProjectID(ctx, tx, name)
-	if err != nil {
-		if api.StatusErrorCheck(err, http.StatusNotFound) {
-			return false, nil
-		}
-
-		return false, err
-	}
-
-	return true, nil
-}
-
 // CreateProject adds a new project to the database.
 // generator: project Create
 func CreateProject(ctx context.Context, tx *sql.Tx, object Project) (int64, error) {
-	// Check if a project with the same key exists.
-	exists, err := ProjectExists(ctx, tx, object.Name)
-	if err != nil {
-		return -1, fmt.Errorf("Failed to check for duplicates: %w", err)
-	}
-
-	if exists {
-		return -1, api.StatusErrorf(http.StatusConflict, "This \"projects\" entry already exists")
-	}
-
 	args := make([]any, 2)
 
 	// Populate the statement arguments.
@@ -285,8 +244,12 @@ func CreateProject(ctx context.Context, tx *sql.Tx, object Project) (int64, erro
 	}
 
 	// Execute the statement.
-	result, err := stmt.Exec(args...)
+	result, err := stmt.ExecContext(ctx, args...)
 	if err != nil {
+		if query.IsConflictErr(err) {
+			return -1, api.NewStatusError(http.StatusConflict, "This \"projects\" entry already exists")
+		}
+
 		return -1, fmt.Errorf("Failed to create \"projects\" entry: %w", err)
 	}
 
@@ -330,11 +293,11 @@ func GetProjectID(ctx context.Context, tx *sql.Tx, name string) (int64, error) {
 	row := stmt.QueryRowContext(ctx, name)
 	var id int64
 	err = row.Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return -1, api.StatusErrorf(http.StatusNotFound, "Project not found")
-	}
-
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return -1, api.StatusErrorf(http.StatusNotFound, "Project not found")
+		}
+
 		return -1, fmt.Errorf("Failed to get \"projects\" ID: %w", err)
 	}
 
@@ -349,8 +312,12 @@ func RenameProject(ctx context.Context, tx *sql.Tx, name string, to string) erro
 		return fmt.Errorf("Failed to get \"projectRename\" prepared statement: %w", err)
 	}
 
-	result, err := stmt.Exec(to, name)
+	result, err := stmt.ExecContext(ctx, to, name)
 	if err != nil {
+		if query.IsConflictErr(err) {
+			return api.NewStatusError(http.StatusConflict, "A \"projects\" entry already exists with this name")
+		}
+
 		return fmt.Errorf("Rename Project failed: %w", err)
 	}
 
@@ -374,7 +341,7 @@ func DeleteProject(ctx context.Context, tx *sql.Tx, name string) error {
 		return fmt.Errorf("Failed to get \"projectDeleteByName\" prepared statement: %w", err)
 	}
 
-	result, err := stmt.Exec(name)
+	result, err := stmt.ExecContext(ctx, name)
 	if err != nil {
 		return fmt.Errorf("Delete \"projects\": %w", err)
 	}

@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/shared"
@@ -1521,8 +1521,7 @@ func (c *cmdStorageVolumeInfo) run(cmd *cobra.Command, args []string) error {
 			var row []string
 
 			fields := strings.Split(snap.Name, shared.SnapshotDelimiter)
-			row = append(row, fields[len(fields)-1])
-			row = append(row, snap.Description)
+			row = append(row, fields[len(fields)-1], snap.Description)
 
 			if snap.ExpiresAt != nil {
 				row = append(row, snap.ExpiresAt.Local().Format(layout))

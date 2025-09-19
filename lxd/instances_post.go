@@ -17,7 +17,6 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/canonical/lxd/lxd/archive"
-	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/backup"
 	"github.com/canonical/lxd/lxd/cluster"
 	"github.com/canonical/lxd/lxd/db"
@@ -32,12 +31,10 @@ import (
 	"github.com/canonical/lxd/lxd/project/limits"
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
-	"github.com/canonical/lxd/lxd/scriptlet"
 	"github.com/canonical/lxd/lxd/state"
 	storagePools "github.com/canonical/lxd/lxd/storage"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
-	apiScriptlet "github.com/canonical/lxd/shared/api/scriptlet"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/osarch"
 	"github.com/canonical/lxd/shared/revert"
@@ -208,15 +205,15 @@ func createFromNone(ctx context.Context, s *state.State, projectName string, pro
 }
 
 func createFromMigration(ctx context.Context, s *state.State, projectName string, profiles []api.Profile, req *api.InstancesPost, isClusterNotification bool) response.Response {
-	reqInfo := request.GetContextInfo(ctx)
-	if reqInfo != nil {
-		if reqInfo.Protocol == "" {
+	requestor, err := request.GetRequestor(ctx)
+	if err == nil {
+		if requestor.CallerProtocol() == "" {
 			return response.SmartError(errors.New("Failed to check request origin: Protocol not set in request context"))
 		}
 
-		// If the protocol is not auth.AuthenticationMethodCluster (e.g. not an internal request) and the node has been
+		// If the protocol is not [request.ProtocolCluster] (e.g. not an internal request) and the node has been
 		// evacuated, reject the request.
-		if s.DB.Cluster.LocalNodeIsEvacuated() && reqInfo.Protocol != auth.AuthenticationMethodCluster {
+		if s.DB.Cluster.LocalNodeIsEvacuated() && requestor.CallerProtocol() != request.ProtocolCluster {
 			return response.Forbidden(errors.New("Cluster member is evacuated"))
 		}
 	}
@@ -658,7 +655,7 @@ func createFromBackup(s *state.State, r *http.Request, projectName string, data 
 	revert := revert.New()
 	defer revert.Fail()
 
-	backupsPath := s.BackupsStoragePath()
+	backupsPath := s.BackupsStoragePath(projectName)
 
 	// Create temporary file to store uploaded backup data.
 	backupFile, err := os.CreateTemp(backupsPath, backup.WorkingDirPrefix+"_")
@@ -966,6 +963,7 @@ func setupInstanceArgs(s *state.State, instType instancetype.Type, projectName s
 //	---
 //	consumes:
 //	  - application/json
+//	  - application/octet-stream
 //	produces:
 //	  - application/json
 //	parameters:
@@ -1002,7 +1000,13 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	targetProjectName := request.ProjectParam(r)
-	clusterNotification := isClusterNotification(r)
+
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	clusterNotification := requestor.IsClusterNotification()
 
 	logger.Debug("Responding to instance create")
 
@@ -1035,7 +1039,7 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 
 	// Parse the request
 	req := api.InstancesPost{}
-	err := json.NewDecoder(r.Body).Decode(&req)
+	err = json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		return response.BadRequest(err)
 	}
@@ -1091,7 +1095,7 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 
 		dbProject, err := dbCluster.GetProject(ctx, tx.Tx(), targetProjectName)
 		if err != nil {
-			return fmt.Errorf("Failed loading project: %w", err)
+			return fmt.Errorf("Failed loading project %q: %w", targetProjectName, err)
 		}
 
 		targetProject, err = dbProject.ToAPI(ctx, tx.Tx())
@@ -1176,7 +1180,6 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 		if len(req.Profiles) > 0 {
 			profileFilters := make([]dbCluster.ProfileFilter, 0, len(req.Profiles))
 			for _, profileName := range req.Profiles {
-				profileName := profileName
 				profileFilters = append(profileFilters, dbCluster.ProfileFilter{
 					Project: &profileProject,
 					Name:    &profileName,
@@ -1296,34 +1299,6 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	if s.ServerClustered && !clusterNotification && targetMemberInfo == nil {
-		// Run instance placement scriptlet if enabled and no cluster member selected yet.
-		if s.GlobalConfig.InstancesPlacementScriptlet() != "" {
-			leaderInfo, err := s.LeaderInfo()
-			if err != nil {
-				return response.InternalError(err)
-			}
-
-			// Copy request so we don't modify it when expanding the config.
-			reqExpanded := apiScriptlet.InstancePlacement{
-				InstancesPost: req,
-				Project:       targetProjectName,
-				Reason:        apiScriptlet.InstancePlacementReasonNew,
-			}
-
-			var globalConfigDump map[string]any
-			if s.GlobalConfig != nil {
-				globalConfigDump = s.GlobalConfig.Dump()
-			}
-
-			reqExpanded.Config = instancetype.ExpandInstanceConfig(globalConfigDump, reqExpanded.Config, profiles)
-			reqExpanded.Devices = instancetype.ExpandInstanceDevices(deviceConfig.NewDevices(reqExpanded.Devices), profiles).CloneNative()
-
-			targetMemberInfo, err = scriptlet.InstancePlacementRun(r.Context(), logger.Log, s, &reqExpanded, candidateMembers, leaderInfo.Address)
-			if err != nil {
-				return response.SmartError(fmt.Errorf("Failed instance placement scriptlet: %w", err))
-			}
-		}
-
 		// If no target member was selected yet, pick the member with the least number of instances.
 		if targetMemberInfo == nil {
 			err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {

@@ -78,10 +78,12 @@ config:
     - nftables
     - rsync
     - squashfs-tools
+    - squashfs-tools-ng
     - tar
     - xz-utils
     # test deps
     - acl
+    - bcache-tools
     - bind9-dnsutils
     - btrfs-progs
     - busybox-static

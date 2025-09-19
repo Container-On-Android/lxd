@@ -456,6 +456,9 @@ type InstanceServer interface {
 	DeleteIdentity(authenticationMethod string, nameOrIdentifier string) error
 	CreateIdentityTLS(identitiesTLSPost api.IdentitiesTLSPost) error
 	CreateIdentityTLSToken(identitiesTLSPost api.IdentitiesTLSPost) (*api.CertificateAddToken, error)
+	CreateIdentityBearer(identitiesBearerPost api.IdentitiesBearerPost) error
+	IssueBearerIdentityToken(nameOrIdentifier string, identityBearerTokenPost api.IdentityBearerTokenPost) (*api.IdentityBearerToken, error)
+	RevokeBearerIdentityToken(nameOrIdentifier string) error
 	GetIdentityProviderGroupNames() (identityProviderGroupNames []string, err error)
 	GetIdentityProviderGroups() (identityProviderGroups []api.IdentityProviderGroup, err error)
 	GetIdentityProviderGroup(identityProviderGroupName string) (identityProviderGroup *api.IdentityProviderGroup, ETag string, err error)
@@ -475,6 +478,9 @@ type InstanceServer interface {
 // The DevLXDServer type represents a devLXD server.
 type DevLXDServer interface {
 	Server
+
+	// Client configuration.
+	UseTarget(name string) (client DevLXDServer)
 
 	// DevLXD info/state.
 	GetState() (state *api.DevLXDGet, err error)
@@ -496,6 +502,20 @@ type DevLXDServer interface {
 
 	// DevLXD images.
 	GetImageFile(fingerprint string, req ImageFileRequest) (resp *ImageFileResponse, err error)
+
+	// DevLXD instance devices.
+	GetInstance(instName string) (inst *api.DevLXDInstance, etag string, err error)
+	UpdateInstance(instName string, inst api.DevLXDInstancePut, ETag string) error
+
+	// DevLXD storage pools.
+	GetStoragePool(poolName string) (pool *api.DevLXDStoragePool, ETag string, err error)
+
+	// DevLXD storage volumes.
+	GetStoragePoolVolumes(poolName string) (vols []api.DevLXDStorageVolume, err error)
+	GetStoragePoolVolume(poolName string, volType string, volName string) (vol *api.DevLXDStorageVolume, ETag string, err error)
+	CreateStoragePoolVolume(poolName string, vol api.DevLXDStorageVolumesPost) error
+	UpdateStoragePoolVolume(poolName string, volType string, volName string, vol api.DevLXDStorageVolumePut, ETag string) error
+	DeleteStoragePoolVolume(poolName string, volType string, volName string) error
 
 	// DevLXD Ubuntu Pro.
 	GetUbuntuPro() (*api.DevLXDUbuntuProSettings, error)

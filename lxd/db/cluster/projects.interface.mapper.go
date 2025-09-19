@@ -9,10 +9,6 @@ import (
 
 // ProjectGenerated is an interface of generated methods for Project.
 type ProjectGenerated interface {
-	// GetProjectConfig returns all available Project Config
-	// generator: project GetMany
-	GetProjectConfig(ctx context.Context, tx *sql.Tx, projectID int, filters ...ConfigFilter) (map[string]string, error)
-
 	// GetProjects returns all available projects.
 	// generator: project GetMany
 	GetProjects(ctx context.Context, tx *sql.Tx, filters ...ProjectFilter) ([]Project, error)
@@ -20,10 +16,6 @@ type ProjectGenerated interface {
 	// GetProject returns the project with the given key.
 	// generator: project GetOne
 	GetProject(ctx context.Context, tx *sql.Tx, name string) (*Project, error)
-
-	// ProjectExists checks if a project with the given key exists.
-	// generator: project Exists
-	ProjectExists(ctx context.Context, tx *sql.Tx, name string) (bool, error)
 
 	// CreateProjectConfig adds new project Config to the database.
 	// generator: project Create

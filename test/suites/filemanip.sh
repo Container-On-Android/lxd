@@ -23,6 +23,8 @@ test_filemanip() {
   chown "${myuid}" "${TEST_DIR}/filemanip"
   lxc --project=test file push "${TEST_DIR}"/filemanip filemanip/root/
   [ "$(lxc exec filemanip --project=test -- cat /root/filemanip)" = "test" ]
+  lxc --project=test file push -p "${TEST_DIR}"/filemanip filemanip/root/temp/
+  [ "$(lxc exec filemanip --project=test -- cat /root/temp/filemanip)" = "test" ]
   chown root "${TEST_DIR}/filemanip"
 
   # lxc {push|pull} -r
@@ -110,8 +112,8 @@ test_filemanip() {
   mkdir "${TEST_DIR}"/dest
   lxc file pull -r filemanip/tmp/ptest/source "${TEST_DIR}"/dest
 
-  [ "$(cat "${TEST_DIR}"/dest/source/foo)" = "foo" ]
-  [ "$(cat "${TEST_DIR}"/dest/source/bar)" = "bar" ]
+  [ "$(< "${TEST_DIR}"/dest/source/foo)" = "foo" ]
+  [ "$(< "${TEST_DIR}"/dest/source/bar)" = "bar" ]
 
   [ "$(stat -c "%u" "${TEST_DIR}"/dest/source)" = "$(id -u)" ]
   [ "$(stat -c "%g" "${TEST_DIR}"/dest/source)" = "$(id -g)" ]
@@ -119,7 +121,7 @@ test_filemanip() {
 
   lxc file push -p "${TEST_DIR}"/source/foo local:filemanip/tmp/this/is/a/nonexistent/directory/
   lxc file pull local:filemanip/tmp/this/is/a/nonexistent/directory/foo "${TEST_DIR}"
-  [ "$(cat "${TEST_DIR}"/foo)" = "foo" ]
+  [ "$(< "${TEST_DIR}"/foo)" = "foo" ]
 
   lxc file push -p "${TEST_DIR}"/source/foo filemanip/.
   [ "$(lxc exec filemanip --project=test -- cat /foo)" = "foo" ]
@@ -173,4 +175,21 @@ test_filemanip() {
   rm -rf "${TEST_DIR}/dest"
   lxc project switch default
   lxc project delete test
+}
+
+test_filemanip_req_content_type() {
+  inst="c-file-push"
+
+  lxc launch testimage "${inst}"
+
+  # This ensures strings.Reader works correctly with the content-type check.
+  # The specific here is that the net/http package will configure the
+  # content-length on the request, which in LXD triggers content-type check.
+  (
+    cd lxd-client
+    go run . file-push "${inst}" /tmp/status.txt "success"
+    [ "$(lxc exec "${inst}" -- cat /tmp/status.txt)" = "success" ]
+  )
+
+  lxc delete "${inst}" --force
 }

@@ -24,13 +24,33 @@ if [ -z "${NO_PROXY:-}" ]; then
   export NO_PROXY="127.0.0.1"
 fi
 
-export DEBUG=""
-if [ -n "${LXD_VERBOSE:-}" ]; then
-  DEBUG="--verbose"
+export CLIENT_DEBUG=""
+export SERVER_DEBUG=""
+export SHELL_TRACING=""
+if [ "${LXD_VERBOSE:-0}" != "0" ]; then
+  if [ "${LXD_VERBOSE}" = "client" ]; then
+      CLIENT_DEBUG="--verbose"
+  elif [ "${LXD_VERBOSE}" = "server" ]; then
+      SERVER_DEBUG="--verbose"
+  else
+      CLIENT_DEBUG="--verbose"
+      SERVER_DEBUG="--verbose"
+  fi
+
+  SHELL_TRACING=1
 fi
 
-if [ -n "${LXD_DEBUG:-}" ]; then
-  DEBUG="--debug"
+if [ "${LXD_DEBUG:-0}" != "0" ]; then
+  if [ "${LXD_DEBUG}" = "client" ]; then
+      CLIENT_DEBUG="--debug"
+  elif [ "${LXD_DEBUG}" = "server" ]; then
+      SERVER_DEBUG="--debug"
+  else
+      CLIENT_DEBUG="--debug"
+      SERVER_DEBUG="--debug"
+  fi
+
+  SHELL_TRACING=1
 fi
 
 # shellcheck disable=SC2034
@@ -49,6 +69,8 @@ import_subdir_files() {
 if [ "${PWD}" != "$(dirname "${0}")" ]; then
     cd "$(dirname "${0}")"
 fi
+MAIN_DIR="${PWD}"
+export MAIN_DIR
 import_subdir_files includes
 
 # Install needed storage driver tools
@@ -58,10 +80,34 @@ install_storage_driver_tools
 install_instance_drivers
 
 echo "==> Checking for dependencies"
-check_dependencies lxd lxc curl busybox dnsmasq iptables jq nc ping yq git s3cmd sqlite3 rsync shuf setfacl setfattr socat swtpm dig xz
+check_dependencies lxd lxc curl busybox dnsmasq iptables jq nc ping python3 yq git s3cmd sqlite3 rsync shuf setfacl setfattr socat swtpm dig tar2sqfs unsquashfs xz
 if [ "${LXD_VM_TESTS:-0}" = "1" ]; then
   check_dependencies qemu-img "qemu-system-$(uname -m)" sgdisk
 fi
+
+echo "==> Checking test dependencies"
+if ! check_dependencies devlxd-client fuidshift mini-oidc sysinfo; then
+  ( cd .. && make test-binaries )
+fi
+
+# If no test image is specified, busybox-static will be needed by test/deps/import-busybox
+if [ -z "${LXD_TEST_IMAGE:-}" ]; then
+  BUSYBOX="$(command -v busybox)"
+  if [ ! -e "${BUSYBOX}" ]; then
+      echo "Please install busybox (busybox-static) or set LXD_TEST_IMAGE"
+      exit 1
+  fi
+
+  if ldd "${BUSYBOX}" >/dev/null 2>&1; then
+      echo "The testsuite requires ${BUSYBOX} to be a static binary"
+      exit 1
+  fi
+fi
+
+# find the path to lxc binary, not the shell wrapper function
+_LXC="$(unset -f lxc; command -v lxc)"
+readonly _LXC
+export _LXC
 
 if [ "${USER:-'root'}" != "root" ]; then
   echo "The testsuite must be run as root." >&2
@@ -89,7 +135,7 @@ import_storage_backends
 cleanup() {
   # Stop tracing everything
   { set +x; } 2>/dev/null
-  if [ -z "${DEBUG:-}" ]; then
+  if [ -z "${SHELL_TRACING:-}" ]; then
     echo "cleanup"
   fi
 
@@ -101,29 +147,27 @@ cleanup() {
 
   # Allow for failures
   set +e
-  DEBUG=
+  unset CLIENT_DEBUG
+  unset SERVER_DEBUG
+  unset SHELL_TRACING
 
-  # Allow for inspection
-  if [ -n "${LXD_INSPECT:-}" ]; then
-    if [ "${TEST_RESULT}" != "success" ]; then
-      echo "==> FAILED TEST: ${TEST_CURRENT#test_} (${TEST_CURRENT_DESCRIPTION})"
-      # red
-      PS1_PREFIX="\033[0;31mLXD-TEST\033[0m"
-    else
-      # green
-      PS1_PREFIX="\033[0;32mLXD-TEST\033[0m"
-    fi
-    echo "==> Test result: ${TEST_RESULT}"
-
-    # Re-execution prevention
-    export LXD_INSPECT_INPROGRESS=true
-
-    echo -e "\033[0;33mDropping to a shell for inspection.\nOnce done, exit (Ctrl-D) to continue\033[0m"
-    export PS1="${PS1_PREFIX} ${PS1:-\u@\h:\w\$ }"
-    bash --norc
-  fi
-
+  # Check if we failed and if so, provide debug info and possibly an inspection shell.
   if [ "${TEST_RESULT}" != "success" ]; then
+    # Allow for inspection on failure
+    if [ -n "${LXD_INSPECT:-}" ]; then
+      # Re-execution prevention
+      export LXD_INSPECT_INPROGRESS=true
+
+      echo "==> FAILED TEST: ${TEST_CURRENT#test_} (${TEST_CURRENT_DESCRIPTION})"
+      echo "==> Test result: ${TEST_RESULT}"
+      # red
+      PS1_PREFIX="\[\033[0;31m\]LXD-TEST\[\033[0m\]"
+
+      echo -e "\033[0;33mDropping to a shell for inspection.\nOnce done, exit (Ctrl-D) to continue\033[0m"
+      export PS1="${PS1_PREFIX} ${PS1:-\u@\h:\w\$ }"
+      bash --norc
+    fi
+
     echo ""
     echo "df -h output:"
     df -h
@@ -161,6 +205,7 @@ cleanup() {
     [ -e "${LXD_TEST_IMAGE:-}" ] && rm "${LXD_TEST_IMAGE}"
 
     kill_oidc
+    clear_ovn_nb_db
     mountpoint -q "${TEST_DIR}/dev" && umount -l "${TEST_DIR}/dev"
     cleanup_lxds "$TEST_DIR"
 
@@ -176,10 +221,6 @@ cleanup() {
   echo "==> Test result: ${TEST_RESULT}"
 }
 
-if [ -n "${DEBUG:-}" ]; then
-  set -x
-fi
-
 # Must be set before cleanup()
 TEST_CURRENT=setup
 TEST_CURRENT_DESCRIPTION=setup
@@ -191,46 +232,22 @@ trap cleanup EXIT HUP INT TERM
 # Import all the testsuites
 import_subdir_files suites
 
+if [ -n "${SHELL_TRACING:-}" ]; then
+  set -x
+fi
+
 # Setup test directory
 TEST_DIR="$(mktemp -d -t lxd-test.tmp.XXXX)"
 chmod +x "${TEST_DIR}"
 
 # Verify the dir chain is accessible for other users (other's execute bit has to be `x` or `t` (sticky))
 # This is to catch if `sudo chmod +x ~` was not run and the TEST_DIR is under `~`
-INACCESSIBLE_DIRS="$(namei -m "${TEST_DIR}" | awk '/^ d/ {print $1}' | grep -v '[xt]$' || true)"
+INACCESSIBLE_DIRS="$(namei -m "${TEST_DIR}" | awk '/^ d/ {if ($1 !~ "^d.*[xt]$") print $2}')"
 if [ -n "${INACCESSIBLE_DIRS:-}" ]; then
     echo "Some directories are not accessible by other users" >&2
     namei -m "${TEST_DIR}"
     exit 1
 fi
-
-if [ "${LXD_TMPFS:-0}" = "1" ]; then
-  mount -t tmpfs tmpfs "${TEST_DIR}" -o mode=0751 -o size=7G
-fi
-
-mkdir -p "${TEST_DIR}/dev"
-mount -t tmpfs none "${TEST_DIR}"/dev
-export LXD_DEVMONITOR_DIR="${TEST_DIR}/dev"
-
-LXD_CONF=$(mktemp -d -p "${TEST_DIR}" XXX)
-export LXD_CONF
-
-LXD_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
-export LXD_DIR
-chmod +x "${LXD_DIR}"
-spawn_lxd "${LXD_DIR}" true
-LXD_ADDR=$(< "${LXD_DIR}/lxd.addr")
-export LXD_ADDR
-
-LXD_SKIP_TESTS="${LXD_SKIP_TESTS:-}"
-export LXD_SKIP_TESTS
-
-LXD_REQUIRED_TESTS="${LXD_REQUIRED_TESTS:-}"
-export LXD_REQUIRED_TESTS
-
-# This must be enough to accomodate the busybox testimage
-SMALL_ROOT_DISK="${SMALL_ROOT_DISK:-"root,size=32MiB"}"
-export SMALL_ROOT_DISK
 
 run_test() {
   TEST_CURRENT=${1}
@@ -294,14 +311,6 @@ if [ -n "${GITHUB_ACTIONS:-}" ]; then
     echo ":--- | :---" >> "${GITHUB_STEP_SUMMARY}"
 fi
 
-# allow for running a specific set of tests
-if [ "$#" -gt 0 ] && [ "$1" != "all" ] && [ "$1" != "cluster" ] && [ "$1" != "standalone" ] && [ "$1" != "test-shell" ]; then
-  run_test "test_${1}"
-  # shellcheck disable=SC2034
-  TEST_RESULT=success
-  exit
-fi
-
 # Spawn an interactive test shell when invoked as `./main.sh test-shell`.
 # This is useful for quick interactions with LXD and its test suite.
 if [ "${1:-"all"}" = "test-shell" ]; then
@@ -319,6 +328,43 @@ if [ "${1:-"all"}" = "test-shell" ]; then
   # To do so, swallow any error code returned from the interactive \`test-shell\`.
   bash --rcfile test-shell.bashrc || true
 
+  exit
+fi
+
+# Preflight check
+if ldd "${_LXC}" | grep -F liblxc; then
+    echo "lxc binary must not be linked with liblxc"
+    exit 1
+fi
+
+if [ "${LXD_TMPFS:-0}" = "1" ]; then
+  mount -t tmpfs tmpfs "${TEST_DIR}" -o mode=0751 -o size=7G
+fi
+
+mkdir -p "${TEST_DIR}/dev"
+mount -t tmpfs none "${TEST_DIR}"/dev
+export LXD_DEVMONITOR_DIR="${TEST_DIR}/dev"
+
+LXD_CONF=$(mktemp -d -p "${TEST_DIR}" XXX)
+export LXD_CONF
+
+LXD_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+export LXD_DIR
+chmod +x "${LXD_DIR}"
+spawn_lxd "${LXD_DIR}" true
+LXD_ADDR=$(< "${LXD_DIR}/lxd.addr")
+export LXD_ADDR
+
+export LXD_SKIP_TESTS="${LXD_SKIP_TESTS:-}"
+
+export LXD_REQUIRED_TESTS="${LXD_REQUIRED_TESTS:-}"
+
+# This must be enough to accomodate the busybox testimage
+export SMALL_ROOT_DISK="${SMALL_ROOT_DISK:-"root,size=32MiB"}"
+
+# allow for running a specific set of tests
+if [ "$#" -gt 0 ] && [ "$1" != "all" ] && [ "$1" != "cluster" ] && [ "$1" != "standalone" ]; then
+  run_test "test_${1}"
   # shellcheck disable=SC2034
   TEST_RESULT=success
   exit
@@ -332,29 +378,9 @@ else
   echo "==> Saving testimage for reuse (${LXD_TEST_IMAGE})"
 fi
 
-if [ "${1:-"all"}" != "cluster" ]; then
-    run_test test_check_deps "checking dependencies"
-    run_test test_database_restore "database restore"
-    run_test test_database_no_disk_space "database out of disk space"
-    run_test test_sql "lxd sql"
-    run_test test_tls_restrictions "TLS restrictions"
-    run_test test_tls_version "TLS version"
-    run_test test_completions "CLI completions"
-    run_test test_oidc "OpenID Connect"
-    run_test test_authorization "Authorization"
-    run_test test_certificate_edit "Certificate edit"
-    run_test test_basic_usage "basic usage"
-    run_test test_basic_version "basic version"
-    run_test test_server_info "server info"
-    run_test test_remote_url "remote url handling"
-    run_test test_remote_url_with_token "remote token handling"
-    run_test test_remote_admin "remote administration"
-    run_test test_remote_usage "remote usage"
-    run_test test_vm_empty "Empty VM"
-fi
-
 if [ "${1:-"all"}" != "standalone" ]; then
     run_test test_clustering_enable "clustering enable"
+    run_test test_clustering_edit_configuration "clustering config edit"
     run_test test_clustering_membership "clustering membership"
     run_test test_clustering_containers "clustering containers"
     run_test test_clustering_storage "clustering storage"
@@ -374,15 +400,14 @@ if [ "${1:-"all"}" != "standalone" ]; then
     run_test test_clustering_dns "clustering DNS"
     run_test test_clustering_fan "clustering FAN"
     run_test test_clustering_recover "clustering recovery"
+    run_test test_clustering_ha "clustering high availability"
     run_test test_clustering_handover "clustering handover"
     run_test test_clustering_rebalance "clustering rebalance"
     run_test test_clustering_remove_raft_node "clustering remove raft node"
     run_test test_clustering_failure_domains "clustering failure domains"
     run_test test_clustering_image_refresh "clustering image refresh"
     run_test test_clustering_evacuation "clustering evacuation"
-    run_test test_clustering_instance_placement_scriptlet "clustering instance placement scriptlet"
     run_test test_clustering_move "clustering move"
-    run_test test_clustering_edit_configuration "clustering config edit"
     run_test test_clustering_remove_members "clustering config remove members"
     run_test test_clustering_autotarget "clustering autotarget member"
     run_test test_clustering_upgrade "clustering upgrade"
@@ -392,9 +417,30 @@ if [ "${1:-"all"}" != "standalone" ]; then
     run_test test_clustering_events "clustering events"
     run_test test_clustering_uuid "clustering uuid"
     run_test test_clustering_trust_add "clustering trust add"
+    run_test test_clustering_waitready "clustering waitready"
 fi
 
 if [ "${1:-"all"}" != "cluster" ]; then
+    run_test test_concurrent "concurrent startup"
+    run_test test_concurrent_exec "concurrent exec"
+    run_test test_database_restore "database restore"
+    run_test test_database_no_disk_space "database out of disk space"
+    run_test test_sql "lxd sql"
+    run_test test_tls_restrictions "TLS restrictions"
+    run_test test_tls_version "TLS version"
+    run_test test_completions "CLI completions"
+    run_test test_oidc "OpenID Connect"
+    run_test test_authorization "Authorization"
+    run_test test_certificate_edit "Certificate edit"
+    run_test test_basic_usage "basic usage"
+    run_test test_duplicate_detection "duplicate detection"
+    run_test test_basic_version "basic version"
+    run_test test_server_info "server info"
+    run_test test_remote_url "remote url handling"
+    run_test test_remote_url_with_token "remote token handling"
+    run_test test_remote_admin "remote administration"
+    run_test test_remote_usage "remote usage"
+    run_test test_vm_empty "Empty VM"
     run_test test_projects_default "default project"
     run_test test_projects_copy "copy/move between projects"
     run_test test_projects_crud "projects CRUD operations"
@@ -412,6 +458,8 @@ if [ "${1:-"all"}" != "cluster" ]; then
     run_test test_projects_yaml "projects with yaml initialization"
     run_test test_projects_before_init "project operations before init"
     run_test test_projects_restrictions "projects restrictions"
+    run_test test_projects_images_volume "projects images volume"
+    run_test test_projects_backups_volume "projects backups volume"
     run_test test_container_devices_disk "container devices - disk"
     run_test test_container_devices_disk_restricted "container devices - disk - restricted"
     run_test test_container_devices_nic_p2p "container devices - nic - p2p"
@@ -444,11 +492,10 @@ if [ "${1:-"all"}" != "cluster" ]; then
     run_test test_image_import_existing_alias "import existing image from alias"
     run_test test_image_refresh "image refresh"
     run_test test_image_acl "image acl"
+    run_test test_images_public "public images"
     run_test test_cloud_init "cloud-init"
     run_test test_exec "exec"
     run_test test_exec_exit_code "exec exit code"
-    run_test test_concurrent_exec "concurrent exec"
-    run_test test_concurrent "concurrent startup"
     run_test test_lxd_benchmark_basic "lxd-benchmark basic init/start/stop/delete"
     run_test test_shutdown "lxd shutdown sequence"
     run_test test_snapshots "container snapshots"
@@ -465,6 +512,7 @@ if [ "${1:-"all"}" != "cluster" ]; then
     run_test test_container_snapshot_config "container snapshot configuration"
     run_test test_server_config "server configuration"
     run_test test_filemanip "file manipulations"
+    run_test test_filemanip_req_content_type "request content-type header verification during file push"
     run_test test_network "network management"
     run_test test_network_acl "network ACL management"
     run_test test_network_forward "network address forwards"
@@ -474,6 +522,7 @@ if [ "${1:-"all"}" != "cluster" ]; then
     run_test test_template "file templating"
     run_test test_pki "PKI mode"
     run_test test_devlxd "/dev/lxd"
+    run_test test_devlxd_volume_management "devLXD volume management"
     run_test test_fuidshift "fuidshift"
     run_test test_migration "migration"
     run_test test_fdleak "fd leak"
@@ -498,6 +547,7 @@ if [ "${1:-"all"}" != "cluster" ]; then
     run_test test_storage_volume_import "storage volume import"
     run_test test_storage_volume_initial_config "storage volume initial configuration"
     run_test test_resources "resources"
+    run_test test_resources_bcache "resources bcache"
     run_test test_kernel_limits "kernel limits"
     run_test test_console "console"
     run_test test_query "query"
@@ -522,6 +572,7 @@ if [ "${1:-"all"}" != "cluster" ]; then
     run_test test_warnings "Warnings"
     run_test test_metrics "Metrics"
     run_test test_storage_volume_recover "Recover storage volumes"
+    run_test test_storage_volume_recover_by_container "Recover storage volumes by container"
     run_test test_syslog_socket "Syslog socket"
     run_test test_lxd_user "lxd user"
     run_test test_waitready "waitready"

@@ -8,7 +8,6 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/canonical/lxd/lxd/auth"
-	clusterRequest "github.com/canonical/lxd/lxd/cluster/request"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/network/zone"
 	"github.com/canonical/lxd/lxd/request"
@@ -134,10 +133,9 @@ var networkZoneRecordCmd = APIEndpoint{
 func networkZoneRecordsGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	var effectiveProjectName string
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo != nil {
-		effectiveProjectName = reqInfo.EffectiveProjectName
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	details, err := request.GetContextValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
@@ -211,10 +209,9 @@ func networkZoneRecordsGet(d *Daemon, r *http.Request) response.Response {
 func networkZoneRecordsPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	var effectiveProjectName string
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo != nil {
-		effectiveProjectName = reqInfo.EffectiveProjectName
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	details, err := request.GetContextValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
@@ -274,10 +271,9 @@ func networkZoneRecordsPost(d *Daemon, r *http.Request) response.Response {
 func networkZoneRecordDelete(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	var effectiveProjectName string
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo != nil {
-		effectiveProjectName = reqInfo.EffectiveProjectName
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	details, err := request.GetContextValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
@@ -350,10 +346,9 @@ func networkZoneRecordDelete(d *Daemon, r *http.Request) response.Response {
 func networkZoneRecordGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	var effectiveProjectName string
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo != nil {
-		effectiveProjectName = reqInfo.EffectiveProjectName
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	details, err := request.GetContextValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
@@ -453,10 +448,9 @@ func networkZoneRecordGet(d *Daemon, r *http.Request) response.Response {
 func networkZoneRecordPut(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	var effectiveProjectName string
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo != nil {
-		effectiveProjectName = reqInfo.EffectiveProjectName
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	details, err := request.GetContextValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
@@ -505,8 +499,12 @@ func networkZoneRecordPut(d *Daemon, r *http.Request) response.Response {
 		}
 	}
 
-	clientType := clusterRequest.UserAgentClientType(r.Header.Get("User-Agent"))
-	err = netzone.UpdateRecord(recordName, req, clientType)
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	err = netzone.UpdateRecord(recordName, req, requestor.ClientType())
 	if err != nil {
 		return response.SmartError(err)
 	}

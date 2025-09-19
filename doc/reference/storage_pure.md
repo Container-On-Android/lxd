@@ -59,8 +59,8 @@ Type            | Identifier   | Example
 Container       | `c-`         | `c-5a2504b06a6c48498ee7ddb0b674fd14`
 Virtual machine | `v-`         | `v-5a2504b06a6c48498ee7ddb0b674fd14-b` (block volume) and `v-5a2504b06a6c48498ee7ddb0b674fd14` (file system volume)
 Image (ISO)     | `i-`         | `i-5a2504b06a6c48498ee7ddb0b674fd14-i`
-Custom volume   | `u-`         | `u-5a2504b06a6c48498ee7ddb0b674fd14`
-Snapshot        | `s`          | `sc-5a2504b06a6c48498ee7ddb0b674fd14` (container snapshot)
+Custom volume   | `u-`         | `u-5a2504b06a6c48498ee7ddb0b674fd14` (file system volume) and `u-5a2504b06a6c48498ee7ddb0b674fd14-b` (block volume)
+Snapshot        | `s`          | `sc-5a2504b06a6c48498ee7ddb0b674fd14` (container snapshot), `sv-5a2504b06a6c48498ee7ddb0b674fd14-b` (VM snapshot) and `su-5a2504b06a6c48498ee7ddb0b674fd14` (custom volume snapshot)
 
 (storage-pure-limitations)=
 ### Limitations
@@ -68,7 +68,7 @@ Snapshot        | `s`          | `sc-5a2504b06a6c48498ee7ddb0b674fd14` (containe
 The `pure` driver has the following limitations:
 
 Volume size constraints
-: Minimum volume size (quota) is `1MiB` and must be a multiple of `512B`.
+: Minimum volume size (quota) is `1MiB` and must be a multiple of `512B`. If the requested size does not meet these conditions, LXD automatically rounds it up to the nearest valid value.
 
 Snapshots cannot be mounted
 : Snapshots cannot be mounted directly to the host. Instead, a temporary volume must be created to access the snapshot's contents.

@@ -22,7 +22,6 @@ import (
 	lxd "github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/apparmor"
 	"github.com/canonical/lxd/lxd/cluster"
-	"github.com/canonical/lxd/lxd/cluster/request"
 	"github.com/canonical/lxd/lxd/daemon"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
@@ -35,6 +34,7 @@ import (
 	"github.com/canonical/lxd/lxd/network/acl"
 	"github.com/canonical/lxd/lxd/network/openvswitch"
 	"github.com/canonical/lxd/lxd/project"
+	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/subprocess"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/lxd/warnings"
@@ -982,8 +982,9 @@ func (n *bridge) Rename(newName string) error {
 	n.logger.Debug("Rename", logger.Ctx{"newName": newName})
 
 	// Reject known bad names that might cause problem when dealing with paths.
-	if strings.Contains(newName, "/") || strings.Contains(newName, "\\") || strings.Contains(newName, "..") {
-		return fmt.Errorf("Invalid network name: %q", newName)
+	err := n.ValidateName(newName)
+	if err != nil {
+		return fmt.Errorf("Invalid network name: %q: %v", newName, err)
 	}
 
 	if InterfaceExists(newName) {
@@ -999,8 +1000,8 @@ func (n *bridge) Rename(newName string) error {
 	}
 
 	// Rename forkdns log file.
-	forkDNSLogPath := "forkdns." + n.name + ".log"
-	if shared.PathExists(shared.LogPath(forkDNSLogPath)) {
+	forkDNSLogPath := shared.LogPath("forkdns." + n.name + ".log")
+	if shared.PathExists(forkDNSLogPath) {
 		err := os.Rename(forkDNSLogPath, shared.LogPath("forkdns."+newName+".log"))
 		if err != nil {
 			return err
@@ -1008,7 +1009,7 @@ func (n *bridge) Rename(newName string) error {
 	}
 
 	// Rename common steps.
-	err := n.rename(newName)
+	err = n.rename(newName)
 	if err != nil {
 		return err
 	}
@@ -1044,6 +1045,276 @@ func (n *bridge) Start() error {
 	return nil
 }
 
+func (n *bridge) getDnsmasqArgs(bridge *ip.Bridge) ([]string, error) {
+	dnsmasqCmd := []string{"--keep-in-foreground", "--strict-order", "--bind-interfaces",
+		"--except-interface=lo",
+		"--pid-file=", // Disable attempt at writing a PID file.
+		"--no-ping",   // --no-ping is very important to prevent delays to lease file updates.
+		"--interface=" + n.name}
+
+	dnsmasqVersion, err := dnsmasq.GetVersion()
+	if err != nil {
+		return nil, err
+	}
+
+	// --dhcp-rapid-commit option is only supported on >2.79.
+	minVer, _ := version.NewDottedVersion("2.79")
+	if dnsmasqVersion.Compare(minVer) > 0 {
+		dnsmasqCmd = append(dnsmasqCmd, "--dhcp-rapid-commit")
+	}
+
+	// --no-negcache option is only supported on >2.47.
+	minVer, _ = version.NewDottedVersion("2.47")
+	if dnsmasqVersion.Compare(minVer) > 0 {
+		dnsmasqCmd = append(dnsmasqCmd, "--no-negcache")
+	}
+
+	if !daemon.Debug {
+		// --quiet options are only supported on >2.67.
+		minVer, _ := version.NewDottedVersion("2.67")
+
+		if dnsmasqVersion.Compare(minVer) > 0 {
+			dnsmasqCmd = append(dnsmasqCmd, "--quiet-dhcp", "--quiet-dhcp6", "--quiet-ra")
+		}
+	}
+
+	// --dhcp-ignore-clid option is only supported on >2.81.
+	// We want this to avoid duplicate IPs assigned to VM copies.
+	// The issue is that, while LXD updates the UUID on VM copy, cloud-init doesn't update machine-id in the new instance,
+	// and the same machine-id with the same link name in VM leads to the same client-id.
+	// So we ask dnsmasq to use MAC instead.
+	minVer, _ = version.NewDottedVersion("2.81")
+	if dnsmasqVersion.Compare(minVer) > 0 {
+		dnsmasqCmd = append(dnsmasqCmd, "--dhcp-ignore-clid")
+	}
+
+	// Configure IPv4.
+	if !slices.Contains([]string{"", "none"}, n.config["ipv4.address"]) {
+		var subnet *net.IPNet
+
+		// Parse the subnet.
+		ipv4Address, subnet, err := net.ParseCIDR(n.config["ipv4.address"])
+		if err != nil {
+			return nil, fmt.Errorf("Failed parsing ipv4.address: %w", err)
+		}
+
+		// Update the dnsmasq config.
+		dnsmasqCmd = append(dnsmasqCmd, "--listen-address="+ipv4Address.String())
+		if n.DHCPv4Subnet() != nil {
+			if !slices.Contains(dnsmasqCmd, "--dhcp-no-override") {
+				dnsmasqCmd = append(dnsmasqCmd, "--dhcp-no-override", "--dhcp-authoritative", "--dhcp-leasefile="+shared.VarPath("networks", n.name, "dnsmasq.leases"), "--dhcp-hostsfile="+shared.VarPath("networks", n.name, "dnsmasq.hosts"))
+			}
+
+			if n.config["ipv4.dhcp.gateway"] != "" {
+				dnsmasqCmd = append(dnsmasqCmd, "--dhcp-option-force=3,"+n.config["ipv4.dhcp.gateway"])
+			}
+
+			if bridge.MTU != bridgeMTUDefault {
+				dnsmasqCmd = append(dnsmasqCmd, fmt.Sprintf("--dhcp-option-force=26,%d", bridge.MTU))
+			}
+
+			dnsSearch := n.config["dns.search"]
+			if dnsSearch != "" {
+				dnsmasqCmd = append(dnsmasqCmd, "--dhcp-option-force=119,"+strings.Trim(dnsSearch, " "))
+			}
+
+			expiry := "1h"
+			if n.config["ipv4.dhcp.expiry"] != "" {
+				expiry = n.config["ipv4.dhcp.expiry"]
+			}
+
+			if n.config["ipv4.dhcp.ranges"] != "" {
+				for dhcpRange := range strings.SplitSeq(n.config["ipv4.dhcp.ranges"], ",") {
+					dhcpRange = strings.TrimSpace(dhcpRange)
+					dnsmasqCmd = append(dnsmasqCmd, "--dhcp-range", fmt.Sprintf("%s,%s", strings.ReplaceAll(dhcpRange, "-", ","), expiry))
+				}
+			} else {
+				dnsmasqCmd = append(dnsmasqCmd, "--dhcp-range", fmt.Sprintf("%s,%s,%s", dhcpalloc.GetIP(subnet, 2).String(), dhcpalloc.GetIP(subnet, -2).String(), expiry))
+			}
+		}
+	}
+
+	// Configure IPv6.
+	if !slices.Contains([]string{"", "none"}, n.config["ipv6.address"]) {
+		// Parse the subnet.
+		ipv6Address, subnet, err := net.ParseCIDR(n.config["ipv6.address"])
+		if err != nil {
+			return nil, fmt.Errorf("Failed parsing ipv6.address: %w", err)
+		}
+
+		subnetSize, _ := subnet.Mask.Size()
+
+		// Update the dnsmasq config.
+		dnsmasqCmd = append(dnsmasqCmd, "--listen-address="+ipv6Address.String(), "--enable-ra")
+		if n.DHCPv6Subnet() != nil {
+			// Build DHCP configuration.
+			if !slices.Contains(dnsmasqCmd, "--dhcp-no-override") {
+				dnsmasqCmd = append(dnsmasqCmd, "--dhcp-no-override", "--dhcp-authoritative", "--dhcp-leasefile="+shared.VarPath("networks", n.name, "dnsmasq.leases"), "--dhcp-hostsfile="+shared.VarPath("networks", n.name, "dnsmasq.hosts"))
+			}
+
+			expiry := "1h"
+			if n.config["ipv6.dhcp.expiry"] != "" {
+				expiry = n.config["ipv6.dhcp.expiry"]
+			}
+
+			if shared.IsTrue(n.config["ipv6.dhcp.stateful"]) {
+				if n.config["ipv6.dhcp.ranges"] != "" {
+					for dhcpRange := range strings.SplitSeq(n.config["ipv6.dhcp.ranges"], ",") {
+						dhcpRange = strings.TrimSpace(dhcpRange)
+						dnsmasqCmd = append(dnsmasqCmd, "--dhcp-range", fmt.Sprintf("%s,%d,%s", strings.ReplaceAll(dhcpRange, "-", ","), subnetSize, expiry))
+					}
+				} else {
+					dnsmasqCmd = append(dnsmasqCmd, "--dhcp-range", fmt.Sprintf("%s,%s,%d,%s", dhcpalloc.GetIP(subnet, 2), dhcpalloc.GetIP(subnet, -1), subnetSize, expiry))
+				}
+			} else {
+				dnsmasqCmd = append(dnsmasqCmd, "--dhcp-range", fmt.Sprintf("::,constructor:%s,ra-stateless,ra-names", n.name))
+			}
+		} else {
+			dnsmasqCmd = append(dnsmasqCmd, "--dhcp-range", fmt.Sprintf("::,constructor:%s,ra-only", n.name))
+		}
+	}
+
+	return dnsmasqCmd, nil
+}
+
+func (n *bridge) addDnsmasqFanArgs(args []string, address string, fanMTU uint32) ([]string, error) {
+	// Parse the host subnet.
+	_, hostSubnet, err := net.ParseCIDR(address + "/24")
+	if err != nil {
+		return nil, fmt.Errorf("Failed parsing fan address: %w", err)
+	}
+
+	expiry := "1h"
+	if n.config["ipv4.dhcp.expiry"] != "" {
+		expiry = n.config["ipv4.dhcp.expiry"]
+	}
+
+	args = append(args,
+		"--listen-address="+address,
+		"--dhcp-no-override", "--dhcp-authoritative",
+		fmt.Sprintf("--dhcp-option-force=26,%d", fanMTU),
+		"--dhcp-leasefile="+shared.VarPath("networks", n.name, "dnsmasq.leases"),
+		"--dhcp-hostsfile="+shared.VarPath("networks", n.name, "dnsmasq.hosts"),
+		"--dhcp-range", fmt.Sprintf("%s,%s,%s", dhcpalloc.GetIP(hostSubnet, 2).String(), dhcpalloc.GetIP(hostSubnet, -2).String(), expiry))
+
+	return args, nil
+}
+
+func (n *bridge) startDnsmasq(dnsmasqCmd []string, dnsClustered bool, dnsClusteredAddress string, overlaySubnet *net.IPNet) error {
+	// Setup the dnsmasq domain.
+	dnsDomain := n.config["dns.domain"]
+	if dnsDomain == "" {
+		dnsDomain = "lxd"
+	}
+
+	if n.config["dns.mode"] != "none" {
+		dnsmasqCmd = append(dnsmasqCmd, "-s", dnsDomain)
+		dnsmasqCmd = append(dnsmasqCmd, "--interface-name", fmt.Sprintf("_gateway.%s,%s", dnsDomain, n.name))
+
+		if dnsClustered {
+			dnsmasqCmd = append(dnsmasqCmd, "-S", fmt.Sprintf("/%s/%s#1053", dnsDomain, dnsClusteredAddress))
+			dnsmasqCmd = append(dnsmasqCmd, fmt.Sprintf("--rev-server=%s,%s#1053", overlaySubnet, dnsClusteredAddress))
+		} else {
+			dnsmasqCmd = append(dnsmasqCmd, "-S", fmt.Sprintf("/%s/", dnsDomain))
+		}
+	}
+
+	// Create a config file to contain additional config (and to prevent dnsmasq from reading /etc/dnsmasq.conf)
+	err := os.WriteFile(shared.VarPath("networks", n.name, "dnsmasq.raw"), []byte(n.config["raw.dnsmasq"]+"\n"), 0644)
+	if err != nil {
+		return err
+	}
+
+	dnsmasqCmd = append(dnsmasqCmd, "--conf-file="+shared.VarPath("networks", n.name, "dnsmasq.raw"))
+
+	// Attempt to drop privileges.
+	if n.state.OS.UnprivUser != "" {
+		dnsmasqCmd = append(dnsmasqCmd, "-u", n.state.OS.UnprivUser)
+	}
+
+	if n.state.OS.UnprivGroup != "" {
+		dnsmasqCmd = append(dnsmasqCmd, "-g", n.state.OS.UnprivGroup)
+	}
+
+	// Create DHCP hosts directory.
+	dnsmasqHostDir := shared.VarPath("networks", n.name, "dnsmasq.hosts")
+	if !shared.PathExists(dnsmasqHostDir) {
+		err = os.MkdirAll(dnsmasqHostDir, 0755)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Check for dnsmasq.
+	_, err = exec.LookPath("dnsmasq")
+	if err != nil {
+		return errors.New("dnsmasq is required for LXD managed bridges")
+	}
+
+	// Update the static leases.
+	err = UpdateDNSMasqStatic(n.state, n.name)
+	if err != nil {
+		return err
+	}
+
+	// Create subprocess object dnsmasq.
+	command := "dnsmasq"
+	dnsmasqLogPath := shared.LogPath(fmt.Sprintf("dnsmasq.%s.log", n.name))
+	p, err := subprocess.NewProcess(command, dnsmasqCmd, "", dnsmasqLogPath)
+	if err != nil {
+		return fmt.Errorf("Failed to create subprocess: %s", err)
+	}
+
+	// Apply AppArmor confinement.
+	if n.config["raw.dnsmasq"] == "" {
+		p.SetApparmor(apparmor.DnsmasqProfileName(n))
+
+		err = warnings.ResolveWarningsByLocalNodeAndProjectAndTypeAndEntity(n.state.DB.Cluster, n.project, warningtype.AppArmorDisabledDueToRawDnsmasq, entity.TypeNetwork, int(n.id))
+		if err != nil {
+			n.logger.Warn("Failed to resolve warning", logger.Ctx{"err": err})
+		}
+	} else {
+		n.logger.Warn("Skipping AppArmor for dnsmasq due to raw.dnsmasq being set", logger.Ctx{"name": n.name})
+
+		err = n.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			return tx.UpsertWarningLocalNode(ctx, n.project, entity.TypeNetwork, int(n.id), warningtype.AppArmorDisabledDueToRawDnsmasq, "")
+		})
+		if err != nil {
+			n.logger.Warn("Failed to create warning", logger.Ctx{"err": err})
+		}
+	}
+
+	// Start dnsmasq.
+	err = p.Start(context.Background())
+	if err != nil {
+		return fmt.Errorf("Failed to run: %s %s: %w", command, strings.Join(dnsmasqCmd, " "), err)
+	}
+
+	// Check dnsmasq started OK.
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Millisecond*time.Duration(500)))
+	_, err = p.Wait(ctx)
+	cancel()
+
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		stderr, _ := os.ReadFile(dnsmasqLogPath)
+
+		return fmt.Errorf("The DNS and DHCP service exited prematurely: %w (%q)", err, strings.TrimSpace(string(stderr)))
+	}
+
+	err = p.Save(shared.VarPath("networks", n.name, "dnsmasq.pid"))
+	if err != nil {
+		// Kill Process if started, but could not save the file.
+		err2 := p.Stop()
+		if err2 != nil {
+			return fmt.Errorf("Could not kill subprocess while handling saving error: %s: %s", err, err2)
+		}
+
+		return fmt.Errorf("Failed to save subprocess details: %s", err)
+	}
+
+	return nil
+}
+
 // setup restarts the network.
 func (n *bridge) setup(oldConfig map[string]string) error {
 	// If we are in mock mode, just no-op.
@@ -1057,8 +1328,9 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 	defer revert.Fail()
 
 	// Create directory.
-	if !shared.PathExists(shared.VarPath("networks", n.name)) {
-		err := os.MkdirAll(shared.VarPath("networks", n.name), 0711)
+	networkDir := shared.VarPath("networks", n.name)
+	if !shared.PathExists(networkDir) {
+		err := os.MkdirAll(networkDir, 0711)
 		if err != nil {
 			return err
 		}
@@ -1385,38 +1657,10 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		}
 	}
 
-	// Start building process using subprocess package.
-	command := "dnsmasq"
-	dnsmasqCmd := []string{"--keep-in-foreground", "--strict-order", "--bind-interfaces",
-		"--except-interface=lo",
-		"--pid-file=", // Disable attempt at writing a PID file.
-		"--no-ping",   // --no-ping is very important to prevent delays to lease file updates.
-		"--interface=" + n.name}
-
-	dnsmasqVersion, err := dnsmasq.GetVersion()
+	// Start building dnsmasq arguments.
+	dnsmasqCmd, err := n.getDnsmasqArgs(&bridge)
 	if err != nil {
 		return err
-	}
-
-	// --dhcp-rapid-commit option is only supported on >2.79.
-	minVer, _ := version.NewDottedVersion("2.79")
-	if dnsmasqVersion.Compare(minVer) > 0 {
-		dnsmasqCmd = append(dnsmasqCmd, "--dhcp-rapid-commit")
-	}
-
-	// --no-negcache option is only supported on >2.47.
-	minVer, _ = version.NewDottedVersion("2.47")
-	if dnsmasqVersion.Compare(minVer) > 0 {
-		dnsmasqCmd = append(dnsmasqCmd, "--no-negcache")
-	}
-
-	if !daemon.Debug {
-		// --quiet options are only supported on >2.67.
-		minVer, _ := version.NewDottedVersion("2.67")
-
-		if dnsmasqVersion.Compare(minVer) > 0 {
-			dnsmasqCmd = append(dnsmasqCmd, []string{"--quiet-dhcp", "--quiet-dhcp6", "--quiet-ra"}...)
-		}
 	}
 
 	var ipv4Address net.IP
@@ -1429,41 +1673,6 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		ipv4Address, subnet, err = net.ParseCIDR(n.config["ipv4.address"])
 		if err != nil {
 			return fmt.Errorf("Failed parsing ipv4.address: %w", err)
-		}
-
-		// Update the dnsmasq config.
-		dnsmasqCmd = append(dnsmasqCmd, "--listen-address="+ipv4Address.String())
-		if n.DHCPv4Subnet() != nil {
-			if !slices.Contains(dnsmasqCmd, "--dhcp-no-override") {
-				dnsmasqCmd = append(dnsmasqCmd, []string{"--dhcp-no-override", "--dhcp-authoritative", "--dhcp-leasefile=" + shared.VarPath("networks", n.name, "dnsmasq.leases"), "--dhcp-hostsfile=" + shared.VarPath("networks", n.name, "dnsmasq.hosts")}...)
-			}
-
-			if n.config["ipv4.dhcp.gateway"] != "" {
-				dnsmasqCmd = append(dnsmasqCmd, "--dhcp-option-force=3,"+n.config["ipv4.dhcp.gateway"])
-			}
-
-			if bridge.MTU != bridgeMTUDefault {
-				dnsmasqCmd = append(dnsmasqCmd, fmt.Sprintf("--dhcp-option-force=26,%d", bridge.MTU))
-			}
-
-			dnsSearch := n.config["dns.search"]
-			if dnsSearch != "" {
-				dnsmasqCmd = append(dnsmasqCmd, "--dhcp-option-force=119,"+strings.Trim(dnsSearch, " "))
-			}
-
-			expiry := "1h"
-			if n.config["ipv4.dhcp.expiry"] != "" {
-				expiry = n.config["ipv4.dhcp.expiry"]
-			}
-
-			if n.config["ipv4.dhcp.ranges"] != "" {
-				for dhcpRange := range strings.SplitSeq(n.config["ipv4.dhcp.ranges"], ",") {
-					dhcpRange = strings.TrimSpace(dhcpRange)
-					dnsmasqCmd = append(dnsmasqCmd, []string{"--dhcp-range", fmt.Sprintf("%s,%s", strings.ReplaceAll(dhcpRange, "-", ","), expiry)}...)
-				}
-			} else {
-				dnsmasqCmd = append(dnsmasqCmd, []string{"--dhcp-range", fmt.Sprintf("%s,%s,%s", dhcpalloc.GetIP(subnet, 2).String(), dhcpalloc.GetIP(subnet, -2).String(), expiry)}...)
-			}
 		}
 
 		// Add the address.
@@ -1583,37 +1792,10 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 			}
 		}
 
-		// Update the dnsmasq config.
-		dnsmasqCmd = append(dnsmasqCmd, []string{"--listen-address=" + ipv6Address.String(), "--enable-ra"}...)
 		if n.DHCPv6Subnet() != nil {
 			if n.hasIPv6Firewall() {
 				fwOpts.FeaturesV6.ICMPDHCPDNSAccess = true
 			}
-
-			// Build DHCP configuration.
-			if !slices.Contains(dnsmasqCmd, "--dhcp-no-override") {
-				dnsmasqCmd = append(dnsmasqCmd, []string{"--dhcp-no-override", "--dhcp-authoritative", "--dhcp-leasefile=" + shared.VarPath("networks", n.name, "dnsmasq.leases"), "--dhcp-hostsfile=" + shared.VarPath("networks", n.name, "dnsmasq.hosts")}...)
-			}
-
-			expiry := "1h"
-			if n.config["ipv6.dhcp.expiry"] != "" {
-				expiry = n.config["ipv6.dhcp.expiry"]
-			}
-
-			if shared.IsTrue(n.config["ipv6.dhcp.stateful"]) {
-				if n.config["ipv6.dhcp.ranges"] != "" {
-					for dhcpRange := range strings.SplitSeq(n.config["ipv6.dhcp.ranges"], ",") {
-						dhcpRange = strings.TrimSpace(dhcpRange)
-						dnsmasqCmd = append(dnsmasqCmd, []string{"--dhcp-range", fmt.Sprintf("%s,%d,%s", strings.ReplaceAll(dhcpRange, "-", ","), subnetSize, expiry)}...)
-					}
-				} else {
-					dnsmasqCmd = append(dnsmasqCmd, []string{"--dhcp-range", fmt.Sprintf("%s,%s,%d,%s", dhcpalloc.GetIP(subnet, 2), dhcpalloc.GetIP(subnet, -1), subnetSize, expiry)}...)
-				}
-			} else {
-				dnsmasqCmd = append(dnsmasqCmd, []string{"--dhcp-range", fmt.Sprintf("::,constructor:%s,ra-stateless,ra-names", n.name)}...)
-			}
-		} else {
-			dnsmasqCmd = append(dnsmasqCmd, []string{"--dhcp-range", fmt.Sprintf("::,constructor:%s,ra-only", n.name)}...)
 		}
 
 		// Allow forwarding.
@@ -1774,12 +1956,6 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 			}
 		}
 
-		// Parse the host subnet.
-		_, hostSubnet, err := net.ParseCIDR(address + "/24")
-		if err != nil {
-			return fmt.Errorf("Failed parsing fan address: %w", err)
-		}
-
 		// Add the address.
 		ipAddr := &ip.Addr{
 			DevName: n.name,
@@ -1793,18 +1969,10 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		}
 
 		// Update the dnsmasq config.
-		expiry := "1h"
-		if n.config["ipv4.dhcp.expiry"] != "" {
-			expiry = n.config["ipv4.dhcp.expiry"]
+		dnsmasqCmd, err = n.addDnsmasqFanArgs(dnsmasqCmd, address, fanMTU)
+		if err != nil {
+			return err
 		}
-
-		dnsmasqCmd = append(dnsmasqCmd, []string{
-			"--listen-address=" + address,
-			"--dhcp-no-override", "--dhcp-authoritative",
-			fmt.Sprintf("--dhcp-option-force=26,%d", fanMTU),
-			"--dhcp-leasefile=" + shared.VarPath("networks", n.name, "dnsmasq.leases"),
-			"--dhcp-hostsfile=" + shared.VarPath("networks", n.name, "dnsmasq.hosts"),
-			"--dhcp-range", fmt.Sprintf("%s,%s,%s", dhcpalloc.GetIP(hostSubnet, 2).String(), dhcpalloc.GetIP(hostSubnet, -2).String(), expiry)}...)
 
 		// Save the dnsmasq listen address so that firewall rules can be added later
 		ipv4Address = net.ParseIP(address)
@@ -2036,128 +2204,24 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 
 	// Configure dnsmasq.
 	if n.UsesDNSMasq() {
-		// Setup the dnsmasq domain.
-		dnsDomain := n.config["dns.domain"]
-		if dnsDomain == "" {
-			dnsDomain = "lxd"
-		}
-
-		if n.config["dns.mode"] != "none" {
-			dnsmasqCmd = append(dnsmasqCmd, "-s", dnsDomain)
-			dnsmasqCmd = append(dnsmasqCmd, "--interface-name", fmt.Sprintf("_gateway.%s,%s", dnsDomain, n.name))
-
-			if dnsClustered {
-				dnsmasqCmd = append(dnsmasqCmd, "-S", fmt.Sprintf("/%s/%s#1053", dnsDomain, dnsClusteredAddress))
-				dnsmasqCmd = append(dnsmasqCmd, fmt.Sprintf("--rev-server=%s,%s#1053", overlaySubnet, dnsClusteredAddress))
-			} else {
-				dnsmasqCmd = append(dnsmasqCmd, "-S", fmt.Sprintf("/%s/", dnsDomain))
-			}
-		}
-
-		// Create a config file to contain additional config (and to prevent dnsmasq from reading /etc/dnsmasq.conf)
-		err = os.WriteFile(shared.VarPath("networks", n.name, "dnsmasq.raw"), []byte(n.config["raw.dnsmasq"]+"\n"), 0644)
+		err = n.startDnsmasq(dnsmasqCmd, dnsClustered, dnsClusteredAddress, overlaySubnet)
 		if err != nil {
 			return err
-		}
-
-		dnsmasqCmd = append(dnsmasqCmd, "--conf-file="+shared.VarPath("networks", n.name, "dnsmasq.raw"))
-
-		// Attempt to drop privileges.
-		if n.state.OS.UnprivUser != "" {
-			dnsmasqCmd = append(dnsmasqCmd, []string{"-u", n.state.OS.UnprivUser}...)
-		}
-
-		if n.state.OS.UnprivGroup != "" {
-			dnsmasqCmd = append(dnsmasqCmd, []string{"-g", n.state.OS.UnprivGroup}...)
-		}
-
-		// Create DHCP hosts directory.
-		if !shared.PathExists(shared.VarPath("networks", n.name, "dnsmasq.hosts")) {
-			err = os.MkdirAll(shared.VarPath("networks", n.name, "dnsmasq.hosts"), 0755)
-			if err != nil {
-				return err
-			}
-		}
-
-		// Check for dnsmasq.
-		_, err := exec.LookPath("dnsmasq")
-		if err != nil {
-			return errors.New("dnsmasq is required for LXD managed bridges")
-		}
-
-		// Update the static leases.
-		err = UpdateDNSMasqStatic(n.state, n.name)
-		if err != nil {
-			return err
-		}
-
-		// Create subprocess object dnsmasq.
-		dnsmasqLogPath := shared.LogPath(fmt.Sprintf("dnsmasq.%s.log", n.name))
-		p, err := subprocess.NewProcess(command, dnsmasqCmd, "", dnsmasqLogPath)
-		if err != nil {
-			return fmt.Errorf("Failed to create subprocess: %s", err)
-		}
-
-		// Apply AppArmor confinement.
-		if n.config["raw.dnsmasq"] == "" {
-			p.SetApparmor(apparmor.DnsmasqProfileName(n))
-
-			err = warnings.ResolveWarningsByLocalNodeAndProjectAndTypeAndEntity(n.state.DB.Cluster, n.project, warningtype.AppArmorDisabledDueToRawDnsmasq, entity.TypeNetwork, int(n.id))
-			if err != nil {
-				n.logger.Warn("Failed to resolve warning", logger.Ctx{"err": err})
-			}
-		} else {
-			n.logger.Warn("Skipping AppArmor for dnsmasq due to raw.dnsmasq being set", logger.Ctx{"name": n.name})
-
-			err = n.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
-				return tx.UpsertWarningLocalNode(ctx, n.project, entity.TypeNetwork, int(n.id), warningtype.AppArmorDisabledDueToRawDnsmasq, "")
-			})
-			if err != nil {
-				n.logger.Warn("Failed to create warning", logger.Ctx{"err": err})
-			}
-		}
-
-		// Start dnsmasq.
-		err = p.Start(context.Background())
-		if err != nil {
-			return fmt.Errorf("Failed to run: %s %s: %w", command, strings.Join(dnsmasqCmd, " "), err)
-		}
-
-		// Check dnsmasq started OK.
-		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Millisecond*time.Duration(500)))
-		_, err = p.Wait(ctx)
-		if !errors.Is(err, context.DeadlineExceeded) {
-			stderr, _ := os.ReadFile(dnsmasqLogPath)
-			cancel()
-
-			return fmt.Errorf("The DNS and DHCP service exited prematurely: %w (%q)", err, strings.TrimSpace(string(stderr)))
-		}
-
-		cancel()
-
-		err = p.Save(shared.VarPath("networks", n.name, "dnsmasq.pid"))
-		if err != nil {
-			// Kill Process if started, but could not save the file.
-			err2 := p.Stop()
-			if err2 != nil {
-				return fmt.Errorf("Could not kill subprocess while handling saving error: %s: %s", err, err2)
-			}
-
-			return fmt.Errorf("Failed to save subprocess details: %s", err)
 		}
 
 		// Spawn DNS forwarder if needed (backgrounded to avoid deadlocks during cluster boot).
 		if dnsClustered {
 			// Create forkdns servers directory.
-			if !shared.PathExists(shared.VarPath("networks", n.name, ForkdnsServersListPath)) {
-				err = os.MkdirAll(shared.VarPath("networks", n.name, ForkdnsServersListPath), 0755)
+			forkdnsPath := shared.VarPath("networks", n.name, ForkdnsServersListPath)
+			if !shared.PathExists(forkdnsPath) {
+				err = os.MkdirAll(forkdnsPath, 0755)
 				if err != nil {
 					return err
 				}
 			}
 
 			// Create forkdns servers.conf file if doesn't exist.
-			f, err := os.OpenFile(shared.VarPath("networks", n.name, ForkdnsServersListPath+"/"+ForkdnsServersListFile), os.O_RDONLY|os.O_CREATE, 0666)
+			f, err := os.OpenFile(forkdnsPath+"/"+ForkdnsServersListFile, os.O_RDONLY|os.O_CREATE, 0666)
 			if err != nil {
 				return err
 			}
@@ -2217,10 +2281,14 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		return err
 	}
 
+	nodeEvacuated := n.state.DB.Cluster.LocalNodeIsEvacuated()
+
 	// Setup BGP.
-	err = n.bgpSetup(oldConfig)
-	if err != nil {
-		return err
+	if !nodeEvacuated {
+		err = n.bgpSetup(oldConfig)
+		if err != nil {
+			return err
+		}
 	}
 
 	revert.Success()
@@ -2310,6 +2378,22 @@ func (n *bridge) Stop() error {
 	}
 
 	return nil
+}
+
+// Evacuate the network by clearing BGP.
+func (n *bridge) Evacuate() error {
+	n.logger.Debug("Evacuate")
+
+	// Clear BGP.
+	return n.bgpClear(n.config)
+}
+
+// Restore the network by setting up BGP.
+func (n *bridge) Restore() error {
+	n.logger.Debug("Restore")
+
+	// Setup BGP.
+	return n.bgpSetup(nil)
 }
 
 // Update updates the network. Accepts notification boolean indicating if this update request is coming from a
@@ -2404,8 +2488,9 @@ func (n *bridge) Update(newNetwork api.NetworkPut, targetNode string, clientType
 
 func (n *bridge) spawnForkDNS(listenAddress string) error {
 	// Reject known bad names that might cause problem when dealing with paths.
-	if strings.Contains(n.Name(), "/") || strings.Contains(n.Name(), "\\") || strings.Contains(n.Name(), "..") {
-		return fmt.Errorf("Invalid network name: %q", n.Name())
+	err := n.ValidateName(n.Name())
+	if err != nil {
+		return fmt.Errorf("Invalid network name: %q: %v", n.Name(), err)
 	}
 
 	// Setup the dnsmasq domain

@@ -18,16 +18,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/kballard/go-shellquote"
 	"github.com/robfig/cron/v3"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/canonical/lxd/shared/osarch"
 	"github.com/canonical/lxd/shared/units"
 )
-
-// stringInSlice checks whether the supplied string is present in the supplied slice.
-func stringInSlice(key string, list []string) bool {
-	return slices.Contains(list, key)
-}
 
 // Required returns function that runs one or more validators, all must pass without error.
 func Required(validators ...func(value string) error) func(value string) error {
@@ -97,21 +92,17 @@ func IsUint32(value string) error {
 // ParseUint32Range parses a uint32 range in the form "number" or "start-end".
 // Returns the start number and the size of the range.
 func ParseUint32Range(value string) (start uint32, rangeSize uint32, err error) {
-	rangeParts := strings.SplitN(value, "-", 2)
-	rangeLen := len(rangeParts)
-	if rangeLen != 1 && rangeLen != 2 {
-		return 0, 0, errors.New("Range must contain a single number or start and end numbers")
-	}
+	startStr, endStr, found := strings.Cut(value, "-")
 
-	startNum, err := strconv.ParseUint(rangeParts[0], 10, 32)
+	startNum, err := strconv.ParseUint(startStr, 10, 32)
 	if err != nil {
 		return 0, 0, fmt.Errorf("Invalid number %q", value)
 	}
 
 	rangeSize = 1
 
-	if rangeLen == 2 {
-		endNum, err := strconv.ParseUint(rangeParts[1], 10, 32)
+	if found {
+		endNum, err := strconv.ParseUint(endStr, 10, 32)
 		if err != nil {
 			return 0, 0, fmt.Errorf("Invalid end number %q", value)
 		}
@@ -152,7 +143,7 @@ func IsInRange(minVal int64, maxVal int64) func(value string) error {
 
 // IsPriority validates priority number.
 func IsPriority(value string) error {
-	valueInt, err := strconv.ParseInt(value, 10, 64)
+	valueInt, err := strconv.Atoi(value)
 	if err != nil {
 		return fmt.Errorf("Invalid value for an integer %q", value)
 	}
@@ -166,7 +157,7 @@ func IsPriority(value string) error {
 
 // IsBool validates if string can be understood as a bool.
 func IsBool(value string) error {
-	if !stringInSlice(strings.ToLower(value), []string{"true", "false", "yes", "no", "1", "0", "on", "off"}) {
+	if !slices.Contains([]string{"true", "false", "yes", "no", "1", "0", "on", "off"}, strings.ToLower(value)) {
 		return fmt.Errorf("Invalid value for a boolean %q", value)
 	}
 
@@ -176,7 +167,7 @@ func IsBool(value string) error {
 // IsOneOf checks whether the string is present in the supplied slice of strings.
 func IsOneOf(valid ...string) func(value string) error {
 	return func(value string) error {
-		if !stringInSlice(value, valid) {
+		if !slices.Contains(valid, value) {
 			return fmt.Errorf("Invalid value %q (not one of %s)", value, valid)
 		}
 
@@ -243,6 +234,11 @@ func IsInterfaceName(value string) error {
 
 	if len(value) > 15 {
 		return errors.New("Network interface is too long (maximum 15 characters)")
+	}
+
+	// Reject known bad names that might cause problem when dealing with paths.
+	if strings.Contains(value, "..") {
+		return errors.New("Network interface name must not contain '..'")
 	}
 
 	// Validate the character set.
@@ -486,13 +482,9 @@ func IsNetworkMTU(value string) error {
 
 // IsNetworkPort validates an IP port number >= 0 and <= 65535.
 func IsNetworkPort(value string) error {
-	port, err := strconv.ParseUint(value, 10, 32)
+	_, err := strconv.ParseUint(value, 10, 16)
 	if err != nil {
 		return fmt.Errorf("Invalid port number %q", value)
-	}
-
-	if port > 65535 {
-		return fmt.Errorf("Out of port number range (0-65535) %q", value)
 	}
 
 	return nil
@@ -500,19 +492,15 @@ func IsNetworkPort(value string) error {
 
 // IsNetworkPortRange validates an IP port range in the format "port" or "start-end".
 func IsNetworkPortRange(value string) error {
-	ports := strings.SplitN(value, "-", 2)
-	portsLen := len(ports)
-	if portsLen != 1 && portsLen != 2 {
-		return errors.New("Port range must contain either a single port or start and end port numbers")
-	}
+	startPortStr, endPortStr, found := strings.Cut(value, "-")
 
-	startPort, err := strconv.ParseUint(ports[0], 10, 32)
+	startPort, err := strconv.ParseUint(startPortStr, 10, 16)
 	if err != nil {
-		return fmt.Errorf("Invalid port number %q", value)
+		return fmt.Errorf("Invalid start port number %q", value)
 	}
 
-	if portsLen == 2 {
-		endPort, err := strconv.ParseUint(ports[1], 10, 32)
+	if found {
+		endPort, err := strconv.ParseUint(endPortStr, 10, 16)
 		if err != nil {
 			return fmt.Errorf("Invalid end port number %q", value)
 		}
@@ -631,7 +619,7 @@ func IsListenAddress(allowDNS bool, allowWildcard bool, requirePort bool) func(v
 		}
 
 		// Validate wildcard.
-		if stringInSlice(host, []string{"", "::", "[::]", "0.0.0.0"}) {
+		if slices.Contains([]string{"", "::", "[::]", "0.0.0.0"}, host) {
 			if !allowWildcard {
 				return errors.New("Wildcard addresses aren't allowed")
 			}

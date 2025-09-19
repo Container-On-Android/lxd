@@ -8,8 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime"
 	"slices"
-	"time"
+	"strconv"
 
 	"github.com/oklog/ulid/v2"
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
@@ -112,7 +113,29 @@ func (e *embeddedOpenFGA) load(ctx context.Context, identityCache *identity.Cach
 	return nil
 }
 
-// CheckPermission checks whether the user who sent the request has the given entitlement on the given entity using the
+// CheckPermission checks if the current requestor has the given entitlement on the given entity URL.
+func (e *embeddedOpenFGA) CheckPermission(ctx context.Context, entityURL *api.URL, entitlement auth.Entitlement) error {
+	return e.checkPermission(ctx, entityURL, entitlement, true)
+}
+
+// CheckPermissionWithoutEffectiveProject checks a permission without considering the effective project that is set in
+// the request context.
+func (e *embeddedOpenFGA) CheckPermissionWithoutEffectiveProject(ctx context.Context, entityURL *api.URL, entitlement auth.Entitlement) error {
+	return e.checkPermission(ctx, entityURL, entitlement, false)
+}
+
+// GetPermissionChecker returns an auth.PermissionChecker for the OpenFGA authorization driver.
+func (e *embeddedOpenFGA) GetPermissionChecker(ctx context.Context, entitlement auth.Entitlement, entityType entity.Type) (auth.PermissionChecker, error) {
+	return e.getPermissionChecker(ctx, entitlement, entityType, true)
+}
+
+// GetPermissionCheckerWithoutEffectiveProject returns an auth.PermissionChecker that does not consider the effective
+// project that is set in the request context.
+func (e *embeddedOpenFGA) GetPermissionCheckerWithoutEffectiveProject(ctx context.Context, entitlement auth.Entitlement, entityType entity.Type) (auth.PermissionChecker, error) {
+	return e.getPermissionChecker(ctx, entitlement, entityType, false)
+}
+
+// checkPermission checks whether the user who sent the request has the given entitlement on the given entity using the
 // embedded OpenFGA server. A http.StatusNotFound error is returned when the entity does not exist, or when the entity
 // exists but the caller does not have permission to view it. A http.StatusForbidden error is returned if the caller has
 // permission to view the entity, but does not have the given entitlement.
@@ -122,57 +145,56 @@ func (e *embeddedOpenFGA) load(ctx context.Context, identityCache *identity.Cach
 // contained within projects that do not have features enabled. For example, if the given entity URL is for a network in
 // project "foo", but project "foo" does not have `features.networks=true`, then we must not use project "foo" in our
 // authorization check because this network does not exist in the database. We will always expect the given entity URL
-// to contain the request project name, but we expect that request.CtxEffectiveProjectName will be set in the request
-// context. The driver will rewrite the project name with the effective project name for the purpose of the authorization
-// check, but will not automatically allow "punching through" to the effective (default) project. An administrator can
-// allow specific permissions against those entities.
-func (e *embeddedOpenFGA) CheckPermission(ctx context.Context, entityURL *api.URL, entitlement auth.Entitlement) error {
+// to contain the request project name, but we expect that effective project will be set in the request.Info in the
+// given context. The driver will rewrite the project name with the effective project name for the purpose of the
+// authorization check, but will not automatically allow "punching through" to the effective (default) project. An
+// administrator can allow specific permissions against those entities. This behaviour is turned off when
+// checkEffectiveProject is false.
+func (e *embeddedOpenFGA) checkPermission(ctx context.Context, entityURL *api.URL, entitlement auth.Entitlement, checkEffectiveProject bool) error {
 	entityType, projectName, location, pathArguments, err := entity.ParseURL(entityURL.URL)
 	if err != nil {
 		return fmt.Errorf("Failed to parse entity URL: %w", err)
 	}
 
 	logCtx := logger.Ctx{"entity_url": entityURL.String(), "entitlement": entitlement}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+
+	requestor, err := request.GetRequestor(ctx)
+	if err != nil {
+		return fmt.Errorf("Failed to check permission: %w", err)
+	}
 
 	// Untrusted requests are denied.
-	if !auth.IsTrusted(ctx) {
+	if !requestor.IsTrusted() {
 		return api.NewGenericStatusError(http.StatusForbidden)
 	}
 
-	isRoot, err := auth.IsServerAdmin(ctx, e.identityCache)
-	if err != nil {
-		return fmt.Errorf("Failed to check caller privilege: %w", err)
-	}
-
 	// Cluster or unix socket requests have admin permission.
-	if isRoot {
+	if requestor.IsAdmin() {
 		return nil
 	}
 
-	id, err := auth.GetIdentityFromCtx(ctx, e.identityCache)
-	if err != nil {
-		return fmt.Errorf("Failed to get caller identity: %w", err)
+	id := requestor.CallerIdentity()
+	if id == nil {
+		return errors.New("No identity is set in the request details")
 	}
 
 	logCtx["username"] = id.Identifier
 	logCtx["protocol"] = id.AuthenticationMethod
 	l := e.logger.AddContext(logCtx)
 
+	identityType, err := identity.New(id.IdentityType)
+	if err != nil {
+		return err
+	}
+
 	// If the identity type does not use fine-grained auth use the TLS driver instead.
-	if !identity.IsFineGrainedIdentityType(id.IdentityType) {
+	if !identityType.IsFineGrained() {
 		return e.tlsAuthorizer.CheckPermission(ctx, entityURL, entitlement)
 	}
 
 	// Combine the users LXD groups with any mappings that have come from the IDP.
 	groups := id.Groups
-	idpGroups, err := auth.GetIdentityProviderGroupsFromCtx(ctx)
-	if err != nil {
-		return fmt.Errorf("Failed to get caller identity provider groups: %w", err)
-	}
-
-	for _, idpGroup := range idpGroups {
+	for _, idpGroup := range requestor.CallerIdentityProviderGroups() {
 		lxdGroups, err := e.identityCache.GetIdentityProviderGroupMapping(idpGroup)
 		if err != nil && !api.StatusErrorCheck(err, http.StatusNotFound) {
 			return fmt.Errorf("Failed to get identity provider group mapping for group %q: %w", idpGroup, err)
@@ -187,12 +209,14 @@ func (e *embeddedOpenFGA) CheckPermission(ctx context.Context, entityURL *api.UR
 		}
 	}
 
-	// The project in the given URL may be for a project that does not have a feature enabled, in this case the auth check
-	// will fail because the resource doesn't actually exist in that project. To correct this, we use the effective project from
-	// the request context if present.
-	reqInfo := request.GetContextInfo(ctx)
-	if reqInfo.EffectiveProjectName != "" {
-		projectName = reqInfo.EffectiveProjectName
+	if checkEffectiveProject {
+		// The project in the given URL may be for a project that does not have a feature enabled, in this case the auth check
+		// will fail because the resource doesn't actually exist in that project. To correct this, we use the effective project from
+		// the request context if present.
+		effectiveProject, _ := request.GetContextValue[string](ctx, request.CtxEffectiveProjectName)
+		if effectiveProject != "" {
+			projectName = effectiveProject
+		}
 	}
 
 	// Construct the URL in a standardised form (adding the project parameter if it was not present).
@@ -250,13 +274,22 @@ func (e *embeddedOpenFGA) CheckPermission(ctx context.Context, entityURL *api.UR
 			return api.NewGenericStatusError(http.StatusNotFound)
 		}
 
-		// Attempt to extract the internal error. This allows bubbling errors up from the OpenFGA datastore implementation.
+		errLogCtx := logger.Ctx{"err": err}
+
+		// Attempt to extract the internal OpenFGA error for logging only, so that errors from the OpenFGA datastore implementation are logged (if any).
 		// (Otherwise we just get "rpc error (4000): Internal Server Error" or similar which isn't useful).
 		var openFGAInternalError openFGAErrors.InternalError
 		if errors.As(err, &openFGAInternalError) {
-			err = openFGAInternalError.Unwrap()
+			errLogCtx["err"] = openFGAInternalError.Unwrap()
 		}
 
+		// Add the callsite to the log context. This gets the file and line number where `[auth.Authorizer].CheckPermission` was called.
+		_, file, line, ok := runtime.Caller(2)
+		if ok {
+			errLogCtx["callsite"] = file + ":" + strconv.Itoa(line)
+		}
+
+		l.Error("Failed to check OpenFGA relation", errLogCtx)
 		return fmt.Errorf("Failed to check OpenFGA relation: %w", err)
 	}
 
@@ -312,16 +345,14 @@ func (e *embeddedOpenFGA) CheckPermission(ctx context.Context, entityURL *api.UR
 	return nil
 }
 
-// GetPermissionChecker returns an auth.PermissionChecker using the embedded OpenFGA server.
+// getPermissionChecker returns an auth.PermissionChecker using the embedded OpenFGA server.
 //
-// Note: As with CheckPermission, we need to be careful about the usage of this function for entity types that may not
-// be enabled within a project. For these cases request.CtxEffectiveProjectName must be set in the given context before
-// this function is called. The returned auth.PermissionChecker will expect entity URLs to contain the request URL. These
-// will be re-written to contain the effective project if set, so that they correspond to the list returned by OpenFGA.
-func (e *embeddedOpenFGA) GetPermissionChecker(ctx context.Context, entitlement auth.Entitlement, entityType entity.Type) (auth.PermissionChecker, error) {
+// Note: As with checkPermission, we need to be careful about the usage of this function for entity types that may not
+// be enabled within a project. If the effective project must be considered, then it must be set on the request.Info
+// before the returned auth.PermissionChecker is called. If checkEffectiveProject is false, the effective project is not
+// considered.
+func (e *embeddedOpenFGA) getPermissionChecker(ctx context.Context, entitlement auth.Entitlement, entityType entity.Type, checkEffectiveProject bool) (auth.PermissionChecker, error) {
 	logCtx := logger.Ctx{"entity_type": entityType, "entitlement": entitlement}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 
 	// allowFunc is used to allow/disallow all.
 	allowFunc := func(b bool) func(*api.URL) bool {
@@ -343,43 +374,43 @@ func (e *embeddedOpenFGA) GetPermissionChecker(ctx context.Context, entitlement 
 		return nil, fmt.Errorf("Failed to get a permission checker: %w", err)
 	}
 
+	requestor, err := request.GetRequestor(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to get a permission checker: %w", err)
+	}
+
 	// Untrusted requests are denied.
-	if !auth.IsTrusted(ctx) {
+	if !requestor.IsTrusted() {
 		return allowFunc(false), nil
 	}
 
-	isRoot, err := auth.IsServerAdmin(ctx, e.identityCache)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to check caller privilege: %w", err)
-	}
-
 	// Cluster or unix socket requests have admin permission.
-	if isRoot {
+	if requestor.IsAdmin() {
 		return allowFunc(true), nil
 	}
 
-	id, err := auth.GetIdentityFromCtx(ctx, e.identityCache)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to get caller identity: %w", err)
+	id := requestor.CallerIdentity()
+	if id == nil {
+		return nil, errors.New("No identity is set in the request details")
 	}
 
 	logCtx["username"] = id.Identifier
 	logCtx["protocol"] = id.AuthenticationMethod
 	l := e.logger.AddContext(logCtx)
 
+	identityType, err := identity.New(id.IdentityType)
+	if err != nil {
+		return nil, err
+	}
+
 	// If the identity type does not use fine-grained auth, use the TLS driver instead.
-	if !identity.IsFineGrainedIdentityType(id.IdentityType) {
+	if !identityType.IsFineGrained() {
 		return e.tlsAuthorizer.GetPermissionChecker(ctx, entitlement, entityType)
 	}
 
 	// Combine the users LXD groups with any mappings that have come from the IDP.
 	groups := id.Groups
-	idpGroups, err := auth.GetIdentityProviderGroupsFromCtx(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to get caller identity provider groups: %w", err)
-	}
-
-	for _, idpGroup := range idpGroups {
+	for _, idpGroup := range requestor.CallerIdentityProviderGroups() {
 		lxdGroups, err := e.identityCache.GetIdentityProviderGroupMapping(idpGroup)
 		if err != nil && !api.StatusErrorCheck(err, http.StatusNotFound) {
 			return nil, fmt.Errorf("Failed to get identity provider group mapping for group %q: %w", idpGroup, err)
@@ -432,13 +463,22 @@ func (e *embeddedOpenFGA) GetPermissionChecker(ctx context.Context, entitlement 
 	l.Debug("Listing related objects for user")
 	resp, err := e.server.ListObjects(ctx, req)
 	if err != nil {
-		// Attempt to extract the internal error. This allows bubbling errors up from the OpenFGA datastore implementation.
+		errLogCtx := logger.Ctx{"err": err}
+
+		// Attempt to extract the internal OpenFGA error for logging only, so that errors from the OpenFGA datastore implementation are logged (if any).
 		// (Otherwise we just get "rpc error (4000): Internal Server Error" or similar which isn't useful).
 		var openFGAInternalError openFGAErrors.InternalError
 		if errors.As(err, &openFGAInternalError) {
-			err = openFGAInternalError.Unwrap()
+			errLogCtx["err"] = openFGAInternalError.Unwrap()
 		}
 
+		// Add the callsite to the log context. This gets the file and line number where `[auth.Authorizer].GetPermissionChecker` was called.
+		_, file, line, ok := runtime.Caller(2)
+		if ok {
+			errLogCtx["callsite"] = file + ":" + strconv.Itoa(line)
+		}
+
+		l.Error("Failed to list OpenFGA Objects", errLogCtx)
 		return nil, fmt.Errorf("Failed to list OpenFGA objects of type %q with entitlement %q for user %q: %w", entityType.String(), entitlement, id.Identifier, err)
 	}
 
@@ -458,12 +498,14 @@ func (e *embeddedOpenFGA) GetPermissionChecker(ctx context.Context, entitlement 
 			return false
 		}
 
-		// The project in the given URL may be for a project that does not have a feature enabled, in this case the auth check
-		// will fail because the resource doesn't actually exist in that project. To correct this, we use the effective project from
-		// the request context if present.
-		reqInfo := request.GetContextInfo(ctx)
-		if reqInfo.EffectiveProjectName != "" {
-			projectName = reqInfo.EffectiveProjectName
+		if checkEffectiveProject {
+			// The project in the given URL may be for a project that does not have a feature enabled, in this case the auth check
+			// will fail because the resource doesn't actually exist in that project. To correct this, we use the effective project from
+			// the request context if present.
+			effectiveProject, _ := request.GetContextValue[string](ctx, request.CtxEffectiveProjectName)
+			if effectiveProject != "" {
+				projectName = effectiveProject
+			}
 		}
 
 		standardisedEntityURL, err := entityType.URL(projectName, location, pathArguments...)

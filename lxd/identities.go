@@ -17,6 +17,7 @@ import (
 
 	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/auth"
+	"github.com/canonical/lxd/lxd/auth/encryption"
 	"github.com/canonical/lxd/lxd/cluster"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
@@ -33,6 +34,12 @@ import (
 	"github.com/canonical/lxd/shared/revert"
 )
 
+const (
+	// defaultBearerTokenExpiry is used when issuing bearer tokens if no expiry is provided.
+	// The default value is 10 years (essentially no expiry).
+	defaultBearerTokenExpiry = "10y"
+)
+
 var identitiesCmd = APIEndpoint{
 	Name:        "identities",
 	Path:        "auth/identities",
@@ -40,7 +47,7 @@ var identitiesCmd = APIEndpoint{
 
 	Get: APIEndpointAction{
 		// Empty authentication method will return all identities.
-		Handler:       getIdentities(""),
+		Handler:       identitiesGet(""),
 		AccessHandler: allowAuthenticated,
 	},
 }
@@ -51,7 +58,7 @@ var currentIdentityCmd = APIEndpoint{
 	MetricsType: entity.TypeIdentity,
 
 	Get: APIEndpointAction{
-		Handler:       getCurrentIdentityInfo,
+		Handler:       identityGetCurrent,
 		AccessHandler: allowAuthenticated,
 	},
 }
@@ -62,11 +69,11 @@ var tlsIdentitiesCmd = APIEndpoint{
 	MetricsType: entity.TypeIdentity,
 
 	Get: APIEndpointAction{
-		Handler:       getIdentities(api.AuthenticationMethodTLS),
+		Handler:       identitiesGet(api.AuthenticationMethodTLS),
 		AccessHandler: allowAuthenticated,
 	},
 	Post: APIEndpointAction{
-		Handler:        createIdentityTLS,
+		Handler:        identitiesTLSPost,
 		AllowUntrusted: true,
 	},
 }
@@ -77,8 +84,23 @@ var oidcIdentitiesCmd = APIEndpoint{
 	MetricsType: entity.TypeIdentity,
 
 	Get: APIEndpointAction{
-		Handler:       getIdentities(api.AuthenticationMethodOIDC),
+		Handler:       identitiesGet(api.AuthenticationMethodOIDC),
 		AccessHandler: allowAuthenticated,
+	},
+}
+
+var bearerIdentitiesCmd = APIEndpoint{
+	Name:        "identities",
+	Path:        "auth/identities/bearer",
+	MetricsType: entity.TypeIdentity,
+
+	Get: APIEndpointAction{
+		Handler:       identitiesGet(api.AuthenticationMethodBearer),
+		AccessHandler: allowAuthenticated,
+	},
+	Post: APIEndpointAction{
+		Handler:       identitiesBearerPost,
+		AccessHandler: allowPermission(entity.TypeServer, auth.EntitlementCanCreateIdentities),
 	},
 }
 
@@ -88,19 +110,19 @@ var tlsIdentityCmd = APIEndpoint{
 	MetricsType: entity.TypeIdentity,
 
 	Get: APIEndpointAction{
-		Handler:       getIdentity,
+		Handler:       identityGet,
 		AccessHandler: identityAccessHandler(api.AuthenticationMethodTLS, auth.EntitlementCanView),
 	},
 	Put: APIEndpointAction{
-		Handler:       updateIdentity(api.AuthenticationMethodTLS),
+		Handler:       identityPut(api.AuthenticationMethodTLS),
 		AccessHandler: allowAuthenticated,
 	},
 	Patch: APIEndpointAction{
-		Handler:       patchIdentity(api.AuthenticationMethodTLS),
+		Handler:       identityPatch(api.AuthenticationMethodTLS),
 		AccessHandler: allowAuthenticated,
 	},
 	Delete: APIEndpointAction{
-		Handler:       deleteIdentity,
+		Handler:       identityDelete,
 		AccessHandler: identityAccessHandler(api.AuthenticationMethodTLS, auth.EntitlementCanDelete),
 	},
 }
@@ -111,20 +133,57 @@ var oidcIdentityCmd = APIEndpoint{
 	MetricsType: entity.TypeIdentity,
 
 	Get: APIEndpointAction{
-		Handler:       getIdentity,
+		Handler:       identityGet,
 		AccessHandler: identityAccessHandler(api.AuthenticationMethodOIDC, auth.EntitlementCanView),
 	},
 	Put: APIEndpointAction{
-		Handler:       updateIdentity(api.AuthenticationMethodOIDC),
+		Handler:       identityPut(api.AuthenticationMethodOIDC),
 		AccessHandler: identityAccessHandler(api.AuthenticationMethodOIDC, auth.EntitlementCanEdit),
 	},
 	Patch: APIEndpointAction{
-		Handler:       patchIdentity(api.AuthenticationMethodOIDC),
+		Handler:       identityPatch(api.AuthenticationMethodOIDC),
 		AccessHandler: identityAccessHandler(api.AuthenticationMethodOIDC, auth.EntitlementCanEdit),
 	},
 	Delete: APIEndpointAction{
-		Handler:       deleteIdentity,
+		Handler:       identityDelete,
 		AccessHandler: identityAccessHandler(api.AuthenticationMethodOIDC, auth.EntitlementCanDelete),
+	},
+}
+
+var bearerIdentityCmd = APIEndpoint{
+	Name:        "identity",
+	Path:        "auth/identities/bearer/{nameOrIdentifier}",
+	MetricsType: entity.TypeIdentity,
+
+	Get: APIEndpointAction{
+		Handler:       identityGet,
+		AccessHandler: identityAccessHandler(api.AuthenticationMethodBearer, auth.EntitlementCanView),
+	},
+	Put: APIEndpointAction{
+		Handler:       identityPut(api.AuthenticationMethodBearer),
+		AccessHandler: identityAccessHandler(api.AuthenticationMethodBearer, auth.EntitlementCanEdit),
+	},
+	Patch: APIEndpointAction{
+		Handler:       identityPatch(api.AuthenticationMethodBearer),
+		AccessHandler: identityAccessHandler(api.AuthenticationMethodBearer, auth.EntitlementCanEdit),
+	},
+	Delete: APIEndpointAction{
+		Handler:       identityDelete,
+		AccessHandler: identityAccessHandler(api.AuthenticationMethodBearer, auth.EntitlementCanDelete),
+	},
+}
+
+var bearerIdentityTokenCmd = APIEndpoint{
+	Path:        "auth/identities/bearer/{nameOrIdentifier}/token",
+	MetricsType: entity.TypeIdentity,
+
+	Post: APIEndpointAction{
+		Handler:       identityBearerTokenPost,
+		AccessHandler: identityAccessHandler(api.AuthenticationMethodBearer, auth.EntitlementCanEdit),
+	},
+	Delete: APIEndpointAction{
+		Handler:       identityBearerTokenDelete,
+		AccessHandler: identityAccessHandler(api.AuthenticationMethodBearer, auth.EntitlementCanEdit),
 	},
 }
 
@@ -182,7 +241,12 @@ func identityAccessHandler(authenticationMethod string, entitlement auth.Entitle
 			return response.SmartError(err)
 		}
 
-		if identity.IsFineGrainedIdentityType(string(id.Type)) {
+		identityType, err := identity.New(string(id.Type))
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		if identityType.IsFineGrained() {
 			err = s.Authorizer.CheckPermission(r.Context(), entity.IdentityURL(authenticationMethod, id.Identifier), entitlement)
 			if err != nil {
 				return response.SmartError(err)
@@ -262,7 +326,7 @@ func identityAccessHandler(authenticationMethod string, entitlement auth.Entitle
 //	    $ref: "#/responses/Forbidden"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
-func createIdentityTLS(d *Daemon, r *http.Request) response.Response {
+func identitiesTLSPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	// Parse the request.
@@ -276,11 +340,233 @@ func createIdentityTLS(d *Daemon, r *http.Request) response.Response {
 	serverCert := s.ServerCert()
 	notify := newIdentityNotificationFunc(s, r, networkCert, serverCert)
 
-	if !auth.IsTrusted(r.Context()) {
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if !requestor.IsTrusted() {
 		return createIdentityTLSUntrusted(r.Context(), s, r.TLS.PeerCertificates, networkCert, req, notify)
 	}
 
 	return createIdentityTLSTrusted(r.Context(), s, networkCert, req, notify)
+}
+
+// swagger:operation POST /1.0/auth/identities/bearer identities identities_post_bearer
+//
+//	Add a bearer identity.
+//
+//	Creates a new bearer identity.
+//
+//	---
+//	consumes:
+//	  - application/json
+//	produces:
+//	  - application/json
+//	parameters:
+//	  - in: body
+//	    name: Bearer identity
+//	    description: Bearer Identity
+//	    required: true
+//	    schema:
+//	      $ref: "#/definitions/IdentitiesBearerPost"
+//	responses:
+//	  "201":
+//	    $ref: "#/responses/EmptySyncResponse"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
+//	  "403":
+//	    $ref: "#/responses/Forbidden"
+//	  "500":
+//	    $ref: "#/responses/InternalServerError"
+func identitiesBearerPost(d *Daemon, r *http.Request) response.Response {
+	s := d.State()
+
+	req := api.IdentitiesBearerPost{}
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		return response.BadRequest(err)
+	}
+
+	if req.Name == "" {
+		return response.BadRequest(errors.New("Identity name must be provided"))
+	}
+
+	idType, err := identity.New(req.Type)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if idType.AuthenticationMethod() != api.AuthenticationMethodBearer {
+		return response.BadRequest(fmt.Errorf("Identities of type %q cannot be created via the bearer API", req.Type))
+	}
+
+	newIdentityID := uuid.New()
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		// Create the identity.
+		id, err := dbCluster.CreateIdentity(ctx, tx.Tx(), dbCluster.Identity{
+			AuthMethod: api.AuthenticationMethodBearer,
+			Type:       dbCluster.IdentityType(req.Type),
+			Identifier: newIdentityID.String(),
+			Name:       req.Name,
+		})
+		if err != nil {
+			return err
+		}
+
+		if len(req.Groups) > 0 {
+			return dbCluster.SetIdentityAuthGroups(ctx, tx.Tx(), int(id), req.Groups)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	networkCert := s.Endpoints.NetworkCert()
+	serverCert := s.ServerCert()
+	notify := newIdentityNotificationFunc(s, r, networkCert, serverCert)
+
+	// Send lifecycle event for identity creation.
+	// No need to update cache because no token has been issued for the identity yet, so they can't authenticate.
+	lc, err := notify(lifecycle.IdentityCreated, api.AuthenticationMethodBearer, newIdentityID.String(), false)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	return response.SyncResponseLocation(true, nil, lc.Source)
+}
+
+// swagger:operation POST /1.0/auth/identities/bearer/{nameOrID}/token identities identity_post_bearer_token
+//
+//	Issue a token for a bearer identity.
+//
+//	Issues a new token for the bearer identity and revokes any existing token.
+//
+//	---
+//	consumes:
+//	  - application/json
+//	produces:
+//	  - application/json
+//	parameters:
+//	  - in: body
+//	    name: Token request
+//	    description: Parameters of token creation
+//	    required: true
+//	    schema:
+//	      $ref: "#/definitions/IdentityBearerTokenPost"
+//	responses:
+//	  "200":
+//	    $ref: "#/responses/IdentityBearerToken"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
+//	  "403":
+//	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "500":
+//	    $ref: "#/responses/InternalServerError"
+func identityBearerTokenPost(d *Daemon, r *http.Request) response.Response {
+	var req api.IdentityBearerTokenPost
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		return response.BadRequest(err)
+	}
+
+	expiry := req.Expiry
+	if expiry == "" {
+		expiry = defaultBearerTokenExpiry
+	}
+
+	expiresAt, err := shared.GetExpiry(time.Now().UTC(), expiry)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	s := d.State()
+
+	id, err := request.GetContextValue[*dbCluster.Identity](r.Context(), ctxClusterDBIdentity)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	var secret []byte
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		secret, err = dbCluster.RotateBearerIdentitySigningKey(ctx, tx.Tx(), id.ID)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	token, err := encryption.GetDevLXDBearerToken(secret, id.Identifier, s.GlobalConfig.ClusterUUID(), expiresAt)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	networkCert := s.Endpoints.NetworkCert()
+	serverCert := s.ServerCert()
+	notify := newIdentityNotificationFunc(s, r, networkCert, serverCert)
+	_, err = notify(lifecycle.IdentityUpdated, api.AuthenticationMethodBearer, id.Identifier, true)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	return response.SyncResponse(true, api.IdentityBearerToken{Token: token})
+}
+
+// swagger:operation POST /1.0/auth/identities/bearer/{nameOrID}/token identities identity_delete_bearer_token
+//
+//	Revoke a bearer identity token.
+//
+//	Revokes any existing token for the identity.
+//
+//	---
+//	consumes:
+//	  - application/json
+//	produces:
+//	  - application/json
+//	responses:
+//	  "403":
+//	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "500":
+//	    $ref: "#/responses/InternalServerError"
+func identityBearerTokenDelete(d *Daemon, r *http.Request) response.Response {
+	s := d.State()
+
+	id, err := request.GetContextValue[*dbCluster.Identity](r.Context(), ctxClusterDBIdentity)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		err := dbCluster.DeleteBearerIdentitySigningKey(ctx, tx.Tx(), id.ID)
+		if err != nil {
+			return fmt.Errorf("Failed to revoke token: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	networkCert := s.Endpoints.NetworkCert()
+	serverCert := s.ServerCert()
+	notify := newIdentityNotificationFunc(s, r, networkCert, serverCert)
+	_, err = notify(lifecycle.IdentityUpdated, api.AuthenticationMethodBearer, id.Identifier, true)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	return response.EmptySyncResponse
 }
 
 // createIdentityTLSUntrusted handles requests to create an identity when the caller is not trusted.
@@ -371,12 +657,6 @@ func createIdentityTLSTrusted(ctx context.Context, s *state.State, networkCert *
 	}
 
 	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
-		// Check if we already have the certificate.
-		_, err := dbCluster.GetIdentityID(ctx, tx.Tx(), api.AuthenticationMethodTLS, fingerprint)
-		if err == nil {
-			return api.StatusErrorf(http.StatusConflict, "Identity already exists")
-		}
-
 		// Create the identity.
 		id, err := dbCluster.CreateIdentity(ctx, tx.Tx(), dbCluster.Identity{
 			AuthMethod: api.AuthenticationMethodTLS,
@@ -386,7 +666,16 @@ func createIdentityTLSTrusted(ctx context.Context, s *state.State, networkCert *
 			Metadata:   metadata,
 		})
 		if err != nil {
-			return err
+			if api.StatusErrorCheck(err, http.StatusConflict) {
+				// Check if we already have the certificate.
+				_, err := dbCluster.GetIdentityID(ctx, tx.Tx(), api.AuthenticationMethodTLS, fingerprint)
+				if err == nil {
+					return api.NewStatusError(http.StatusConflict, "Identity already exists")
+				}
+
+				// If there are no identities with the same fingerprint, then there is a name conflict
+				return api.StatusErrorf(http.StatusConflict, "An identity with name %q already exists", req.Name)
+			}
 		}
 
 		if len(req.Groups) > 0 {
@@ -408,12 +697,12 @@ func createIdentityTLSTrusted(ctx context.Context, s *state.State, networkCert *
 	return response.SyncResponseLocation(true, nil, lc.Source)
 }
 
-func createIdentityTLSPending(ctx context.Context, s *state.State, req api.IdentitiesTLSPost, notify identityNotificationFunc) response.Response {
+func createCertificateAddToken(s *state.State, clientName string, identityType string) (*api.CertificateAddToken, error) {
 	localHTTPSAddress := s.LocalConfig.HTTPSAddress()
 
 	// Tokens are useless if the server isn't listening (how will the untrusted client contact the server?)
 	if localHTTPSAddress == "" {
-		return response.BadRequest(errors.New("Can't issue token when server isn't listening on network"))
+		return nil, api.NewStatusError(http.StatusBadRequest, "Can't issue token when server isn't listening on network")
 	}
 
 	// Get all addresses the server is listening on. This is encoded in the certificate token,
@@ -421,7 +710,7 @@ func createIdentityTLSPending(ctx context.Context, s *state.State, req api.Ident
 	// through all these addresses until it can connect to one of them.
 	addresses, err := util.ListenAddresses(localHTTPSAddress)
 	if err != nil {
-		return response.InternalError(err)
+		return nil, err
 	}
 
 	// Generate join secret for new client. This will be stored inside the join token operation and will be
@@ -429,14 +718,14 @@ func createIdentityTLSPending(ctx context.Context, s *state.State, req api.Ident
 	// operation in order to validate the requested joining client name is correct and authorised.
 	joinSecret, err := shared.RandomCryptoString()
 	if err != nil {
-		return response.InternalError(err)
+		return nil, err
 	}
 
 	// Generate fingerprint of network certificate so joining member can automatically trust the correct
 	// certificate when it is presented during the join process.
 	fingerprint, err := shared.CertFingerprintStr(string(s.Endpoints.NetworkPublicKey()))
 	if err != nil {
-		return response.InternalError(err)
+		return nil, err
 	}
 
 	// Calculate an expiry for the pending TLS identity.
@@ -445,15 +734,37 @@ func createIdentityTLSPending(ctx context.Context, s *state.State, req api.Ident
 	if expiry != "" {
 		expiresAt, err = shared.GetExpiry(time.Now(), expiry)
 		if err != nil {
-			return response.InternalError(err)
+			return nil, err
 		}
+	}
+
+	// Return the CertificateAddToken.
+	token := api.CertificateAddToken{
+		ClientName:  clientName,
+		Fingerprint: fingerprint,
+		Addresses:   addresses,
+		Secret:      joinSecret,
+		ExpiresAt:   expiresAt,
+		// Set the Type field so that the client can differentiate
+		// between tokens meant for the certificates API and the auth API.
+		Type: identityType,
+	}
+
+	return &token, nil
+}
+
+func createIdentityTLSPending(ctx context.Context, s *state.State, req api.IdentitiesTLSPost, notify identityNotificationFunc) response.Response {
+	// Create CertificateAddToken token.
+	token, err := createCertificateAddToken(s, req.Name, api.IdentityTypeCertificateClient)
+	if err != nil {
+		return response.SmartError(fmt.Errorf("Failed to create certificate add token: %w", err))
 	}
 
 	// Generate an identifier for the identity and calculate its metadata.
 	identifier := uuid.New()
 	metadata := dbCluster.PendingTLSMetadata{
-		Secret: joinSecret,
-		Expiry: expiresAt,
+		Secret: token.Secret,
+		Expiry: token.ExpiresAt,
 	}
 
 	metadataJSON, err := json.Marshal(metadata)
@@ -481,19 +792,12 @@ func createIdentityTLSPending(ctx context.Context, s *state.State, req api.Ident
 		return nil
 	})
 	if err != nil {
-		return response.InternalError(fmt.Errorf("Failed to create pending TLS identity: %w", err))
-	}
+		if api.StatusErrorCheck(err, http.StatusConflict) {
+			// The only conflict here should be on identity name, since the identifier is a UUID.
+			return response.Conflict(fmt.Errorf("An identity with name %q already exists", req.Name))
+		}
 
-	// Return the CertificateAddToken.
-	token := api.CertificateAddToken{
-		ClientName:  req.Name,
-		Fingerprint: fingerprint,
-		Addresses:   addresses,
-		Secret:      joinSecret,
-		ExpiresAt:   expiresAt,
-		// Set the Type field so that the client can differentiate
-		// between tokens meant for the certificates API and the auth API.
-		Type: api.IdentityTypeCertificateClient,
+		return response.SmartError(fmt.Errorf("Failed to create pending TLS identity: %w", err))
 	}
 
 	// Notify other members, update the cache, and send a lifecycle event.
@@ -788,7 +1092,7 @@ func tlsIdentityTokenValidate(ctx context.Context, s *state.State, token api.Cer
 //	    $ref: "#/responses/Forbidden"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
-func getIdentities(authenticationMethod string) func(d *Daemon, r *http.Request) response.Response {
+func identitiesGet(authenticationMethod string) func(d *Daemon, r *http.Request) response.Response {
 	return func(d *Daemon, r *http.Request) response.Response {
 		recursion := util.IsRecursionRequest(r)
 		s := d.State()
@@ -808,7 +1112,12 @@ func getIdentities(authenticationMethod string) func(d *Daemon, r *http.Request)
 		}
 
 		canView := func(id dbCluster.Identity) bool {
-			if identity.IsFineGrainedIdentityType(string(id.Type)) {
+			identityType, err := identity.New(string(id.Type))
+			if err != nil {
+				return false
+			}
+
+			if identityType.IsFineGrained() {
 				return canViewIdentity(entity.IdentityURL(string(id.AuthMethod), id.Identifier))
 			}
 
@@ -874,7 +1183,7 @@ func getIdentities(authenticationMethod string) func(d *Daemon, r *http.Request)
 		// Optimisation for when only one identity is present on the system.
 		if apiIdentity != nil {
 			if len(withEntitlements) > 0 {
-				err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeIdentity, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.IdentityURL(apiIdentity.AuthenticationMethod, apiIdentity.Identifier): apiIdentity})
+				err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeIdentity, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.IdentityURL(apiIdentity.AuthenticationMethod, apiIdentity.Identifier): apiIdentity})
 				if err != nil {
 					return response.SmartError(err)
 				}
@@ -898,7 +1207,12 @@ func getIdentities(authenticationMethod string) func(d *Daemon, r *http.Request)
 			urlToIdentity := make(map[*api.URL]auth.EntitlementReporter, len(identities))
 			for _, id := range identities {
 				var certificate string
-				if id.AuthMethod == api.AuthenticationMethodTLS && id.Type != api.IdentityTypeCertificateClientPending {
+				identityType, err := identity.New(string(id.Type))
+				if err != nil {
+					return response.SmartError(err)
+				}
+
+				if id.AuthMethod == api.AuthenticationMethodTLS && !identityType.IsPending() {
 					metadata, err := id.CertificateMetadata()
 					if err != nil {
 						return response.SmartError(err)
@@ -921,7 +1235,7 @@ func getIdentities(authenticationMethod string) func(d *Daemon, r *http.Request)
 			}
 
 			if len(withEntitlements) > 0 {
-				err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeIdentity, withEntitlements, urlToIdentity)
+				err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeIdentity, withEntitlements, urlToIdentity)
 				if err != nil {
 					return response.SmartError(err)
 				}
@@ -1008,7 +1322,7 @@ func getIdentities(authenticationMethod string) func(d *Daemon, r *http.Request)
 //	    $ref: "#/responses/Forbidden"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
-func getIdentity(d *Daemon, r *http.Request) response.Response {
+func identityGet(d *Daemon, r *http.Request) response.Response {
 	id, err := request.GetContextValue[*dbCluster.Identity](r.Context(), ctxClusterDBIdentity)
 	if err != nil {
 		return response.SmartError(err)
@@ -1040,7 +1354,7 @@ func getIdentity(d *Daemon, r *http.Request) response.Response {
 	}
 
 	if len(withEntitlements) > 0 {
-		err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeIdentity, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.IdentityURL(string(id.AuthMethod), id.Identifier): apiIdentity})
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeIdentity, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.IdentityURL(string(id.AuthMethod), id.Identifier): apiIdentity})
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -1083,22 +1397,22 @@ func getIdentity(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/Forbidden"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
-func getCurrentIdentityInfo(d *Daemon, r *http.Request) response.Response {
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo == nil {
-		return response.SmartError(errors.New("Failed to get request info from the request"))
+func identityGetCurrent(d *Daemon, r *http.Request) response.Response {
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
 	}
 
-	if reqInfo.Username == "" {
+	if requestor.CallerUsername() == "" {
 		return response.SmartError(errors.New("Failed to get identity identifier from request info"))
 	}
 
-	if reqInfo.Protocol == "" {
+	if requestor.CallerProtocol() == "" {
 		return response.SmartError(errors.New("Failed to get authentication method from request info"))
 	}
 
 	// Must be a remote API request.
-	err := identity.ValidateAuthenticationMethod(reqInfo.Protocol)
+	err = identity.ValidateAuthenticationMethod(requestor.CallerProtocol())
 	if err != nil {
 		return response.BadRequest(errors.New("Current identity information must be requested via the HTTPS API"))
 	}
@@ -1108,7 +1422,7 @@ func getCurrentIdentityInfo(d *Daemon, r *http.Request) response.Response {
 	var effectiveGroups []string
 	var effectivePermissions []api.Permission
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
-		id, err := dbCluster.GetIdentity(ctx, tx.Tx(), dbCluster.AuthMethod(reqInfo.Protocol), reqInfo.Username)
+		id, err := dbCluster.GetIdentity(ctx, tx.Tx(), dbCluster.AuthMethod(requestor.CallerProtocol()), requestor.CallerUsername())
 		if err != nil {
 			return fmt.Errorf("Failed to get current identity from database: %w", err)
 		}
@@ -1121,7 +1435,7 @@ func getCurrentIdentityInfo(d *Daemon, r *http.Request) response.Response {
 		}
 
 		effectiveGroups = apiIdentity.Groups
-		mappedGroups, err := dbCluster.GetDistinctAuthGroupNamesFromIDPGroupNames(ctx, tx.Tx(), reqInfo.IdentityProviderGroups)
+		mappedGroups, err := dbCluster.GetDistinctAuthGroupNamesFromIDPGroupNames(ctx, tx.Tx(), requestor.CallerIdentityProviderGroups())
 		if err != nil {
 			return fmt.Errorf("Failed to get effective groups: %w", err)
 		}
@@ -1157,11 +1471,16 @@ func getCurrentIdentityInfo(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
+	identityType, err := identity.New(apiIdentity.Type)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	return response.SyncResponse(true, api.IdentityInfo{
 		Identity:             *apiIdentity,
 		EffectiveGroups:      effectiveGroups,
 		EffectivePermissions: effectivePermissions,
-		FineGrained:          identity.IsFineGrainedIdentityType(apiIdentity.Type),
+		FineGrained:          identityType.IsFineGrained(),
 	})
 }
 
@@ -1226,7 +1545,7 @@ func getCurrentIdentityInfo(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/InternalServerError"
 //	  "501":
 //	    $ref: "#/responses/NotImplemented"
-func updateIdentity(authenticationMethod string) func(d *Daemon, r *http.Request) response.Response {
+func identityPut(authenticationMethod string) func(d *Daemon, r *http.Request) response.Response {
 	return func(d *Daemon, r *http.Request) response.Response {
 		s := d.State()
 		id, err := addIdentityDetailsToContext(s, r, authenticationMethod)
@@ -1234,7 +1553,12 @@ func updateIdentity(authenticationMethod string) func(d *Daemon, r *http.Request
 			return response.SmartError(err)
 		}
 
-		if !identity.IsFineGrainedIdentityType(string(id.Type)) {
+		identityType, err := identity.New(string(id.Type))
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		if !identityType.IsFineGrained() {
 			return response.NotImplemented(fmt.Errorf("Identities of type %q cannot be modified via this API", id.Type))
 		}
 
@@ -1244,7 +1568,7 @@ func updateIdentity(authenticationMethod string) func(d *Daemon, r *http.Request
 			return response.BadRequest(fmt.Errorf("Failed to unmarshal request body: %w", err))
 		}
 
-		if id.Type != api.IdentityTypeCertificateClient && identityPut.TLSCertificate != "" {
+		if identityType.AuthenticationMethod() == api.AuthenticationMethodTLS && identityType.IsPending() && identityPut.TLSCertificate != "" {
 			return response.BadRequest(fmt.Errorf("Cannot update certificate for identities of type %q", id.Type))
 		}
 
@@ -1255,18 +1579,13 @@ func updateIdentity(authenticationMethod string) func(d *Daemon, r *http.Request
 			return response.SmartError(err)
 		}
 
-		// Only identities of type api.IdentityTypeCertificateClient may update their own certificate
-		if id.Type != api.IdentityTypeCertificateClient {
-			return response.Forbidden(nil)
-		}
-
-		username, err := auth.GetUsernameFromCtx(r.Context())
+		requestor, err := request.GetRequestor(r.Context())
 		if err != nil {
 			return response.SmartError(err)
 		}
 
 		// Identities may only update their own certificate
-		if username != id.Identifier {
+		if requestor.CallerUsername() != id.Identifier {
 			return response.Forbidden(nil)
 		}
 
@@ -1459,7 +1778,7 @@ func updateIdentityPrivileged(s *state.State, r *http.Request, id dbCluster.Iden
 //	    $ref: "#/responses/InternalServerError"
 //	  "501":
 //	    $ref: "#/responses/NotImplemented"
-func patchIdentity(authenticationMethod string) func(d *Daemon, r *http.Request) response.Response {
+func identityPatch(authenticationMethod string) func(d *Daemon, r *http.Request) response.Response {
 	return func(d *Daemon, r *http.Request) response.Response {
 		s := d.State()
 		id, err := addIdentityDetailsToContext(s, r, authenticationMethod)
@@ -1467,7 +1786,12 @@ func patchIdentity(authenticationMethod string) func(d *Daemon, r *http.Request)
 			return response.SmartError(err)
 		}
 
-		if !identity.IsFineGrainedIdentityType(string(id.Type)) {
+		identityType, err := identity.New(string(id.Type))
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		if !identityType.IsFineGrained() {
 			return response.NotImplemented(fmt.Errorf("Identities of type %q cannot be modified via this API", id.Type))
 		}
 
@@ -1477,7 +1801,7 @@ func patchIdentity(authenticationMethod string) func(d *Daemon, r *http.Request)
 			return response.BadRequest(fmt.Errorf("Failed to unmarshal request body: %w", err))
 		}
 
-		if id.Type != api.IdentityTypeCertificateClient && identityPut.TLSCertificate != "" {
+		if identityType.AuthenticationMethod() == api.AuthenticationMethodTLS && identityType.IsPending() && identityPut.TLSCertificate != "" {
 			return response.BadRequest(fmt.Errorf("Cannot update certificate for identities of type %q", id.Type))
 		}
 
@@ -1493,18 +1817,13 @@ func patchIdentity(authenticationMethod string) func(d *Daemon, r *http.Request)
 			return response.SmartError(err)
 		}
 
-		// Only identities of type api.IdentityTypeCertificateClient may update their own certificate
-		if id.Type != api.IdentityTypeCertificateClient {
-			return response.Forbidden(nil)
-		}
-
-		username, err := auth.GetUsernameFromCtx(r.Context())
+		requestor, err := request.GetRequestor(r.Context())
 		if err != nil {
 			return response.SmartError(err)
 		}
 
 		// Identities may only update their own certificate
-		if username != id.Identifier {
+		if requestor.CallerUsername() != id.Identifier {
 			return response.Forbidden(nil)
 		}
 
@@ -1687,13 +2006,18 @@ func patchSelfIdentityUnprivileged(s *state.State, r *http.Request, id dbCluster
 //	    $ref: "#/responses/InternalServerError"
 //	  "501":
 //	    $ref: "#/responses/NotImplemented"
-func deleteIdentity(d *Daemon, r *http.Request) response.Response {
+func identityDelete(d *Daemon, r *http.Request) response.Response {
 	id, err := request.GetContextValue[*dbCluster.Identity](r.Context(), ctxClusterDBIdentity)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	if !identity.IsFineGrainedIdentityType(string(id.Type)) {
+	identityType, err := identity.New(string(id.Type))
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if !identityType.IsFineGrained() {
 		return response.NotImplemented(fmt.Errorf("Identities of type %q cannot be modified via this API", id.Type))
 	}
 
@@ -1739,7 +2063,7 @@ func newIdentityNotificationFunc(s *state.State, r *http.Request, networkCert *s
 		}
 
 		lc := action.Event(authenticationMethod, identifier, request.CreateRequestor(r.Context()), nil)
-		s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+		s.Events.SendLifecycle("", lc)
 
 		return &lc, nil
 	}
@@ -1783,6 +2107,7 @@ func updateIdentityCache(d *Daemon) {
 	projects := make(map[int][]string)
 	groups := make(map[int][]string)
 	idpGroupMapping := make(map[string][]string)
+	bearerIdentitySecrets := make(map[int]dbCluster.AuthSecretValue)
 	var err error
 	err = s.DB.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
 		identities, err = dbCluster.GetIdentitys(ctx, tx.Tx())
@@ -1825,27 +2150,28 @@ func updateIdentityCache(d *Daemon) {
 			idpGroupMapping[apiIDPGroup.Name] = apiIDPGroup.Groups
 		}
 
+		bearerIdentitySecrets, err = dbCluster.GetAllBearerIdentitySigningKeys(ctx, tx.Tx())
+		if err != nil {
+			return err
+		}
+
 		return nil
 	})
 	if err != nil {
-		logger.Warn("Failed reading certificates from global database", logger.Ctx{"err": err})
+		logger.Warn("Failed reading identities from global database", logger.Ctx{"err": err})
 		return
-	}
-
-	cacheableIdentityTypes := []string{
-		api.IdentityTypeCertificateClientRestricted,
-		api.IdentityTypeCertificateClientUnrestricted,
-		api.IdentityTypeCertificateClient,
-		api.IdentityTypeCertificateServer,
-		api.IdentityTypeCertificateMetricsRestricted,
-		api.IdentityTypeCertificateMetricsUnrestricted,
-		api.IdentityTypeOIDCClient,
 	}
 
 	identityCacheEntries := make([]identity.CacheEntry, 0, len(identities))
 	var localServerCerts []dbCluster.Certificate
 	for _, id := range identities {
-		if !slices.Contains(cacheableIdentityTypes, string(id.Type)) {
+		identityType, err := identity.New(string(id.Type))
+		if err != nil {
+			logger.Warn("Failed to create identity type", logger.Ctx{"type": string(id.Type), "err": err})
+			continue
+		}
+
+		if identityType.IsPending() {
 			continue
 		}
 
@@ -1874,6 +2200,14 @@ func updateIdentityCache(d *Daemon) {
 			}
 
 			cacheEntry.Subject = subject
+		} else if cacheEntry.AuthenticationMethod == api.AuthenticationMethodBearer {
+			secret, ok := bearerIdentitySecrets[id.ID]
+			if !ok {
+				// No need to add bearer identities with no secret to the cache, they cannot authenticate.
+				continue
+			}
+
+			cacheEntry.Secret = secret
 		}
 
 		identityCacheEntries = append(identityCacheEntries, cacheEntry)

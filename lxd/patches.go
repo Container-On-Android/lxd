@@ -15,10 +15,12 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/backup"
 	"github.com/canonical/lxd/lxd/certificate"
 	"github.com/canonical/lxd/lxd/cluster"
 	clusterConfig "github.com/canonical/lxd/lxd/cluster/config"
+	"github.com/canonical/lxd/lxd/config"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/query"
@@ -102,6 +104,11 @@ var patches = []patch{
 	{name: "oidc_groups_claim_scope", stage: patchPreLoadClusterConfig, run: patchOIDCGroupsClaimScope},
 	{name: "remove_backupsimages_symlinks", stage: patchPostDaemonStorage, run: patchRemoveBackupsImagesSymlinks},
 	{name: "move_images_storage", stage: patchPostDaemonStorage, run: patchMoveBackupsImagesStorage},
+	{name: "cluster_config_volatile_uuid", stage: patchPreLoadClusterConfig, run: patchClusterConfigVolatileUUID},
+	{name: "storage_update_powerflex_clone_copy_setting", stage: patchPostDaemonStorage, run: patchUpdatePowerFlexCloneCopySetting},
+	{name: "storage_update_powerflex_snapshot_prefix", stage: patchPostDaemonStorage, run: patchUpdatePowerFlexSnapshotPrefix},
+	{name: "config_remove_instances_placement_scriptlet", stage: patchPreLoadClusterConfig, run: patchRemoveInstancesPlacementScriptlet},
+	{name: "event_entitlement_rename", stage: patchPreLoadClusterConfig, run: patchEventEntitlementNames},
 }
 
 type patch struct {
@@ -324,7 +331,7 @@ func patchClusteringServerCertTrust(name string, d *Daemon) error {
 			continue
 		}
 
-		logger.Infof("Trusted server certificates found in trust store for all cluster members")
+		logger.Info("Trusted server certificates found in trust store for all cluster members")
 		break
 	}
 
@@ -743,7 +750,7 @@ func patchNetworkOVNEnableNAT(name string, d *Daemon) error {
 
 // Moves backups from shared.VarPath("backups") to shared.VarPath("backups", "instances").
 func patchMoveBackupsInstances(name string, d *Daemon) error {
-	backupsPathBase := d.State().BackupsStoragePath()
+	backupsPathBase := d.State().BackupsStoragePath("")
 	if !shared.PathExists(backupsPathBase) {
 		return nil // Nothing to do, no backups directory.
 	}
@@ -1477,7 +1484,7 @@ func patchOIDCGroupsClaimScope(_ string, d *Daemon) error {
 		// Add the groups claim as an additional scope.
 		// The groups claim still needs to be set to extract group values from the token claims or userinfo.
 		oidcScopes := append(scopes, groupsClaim)
-		_, err = globalConfig.Patch(map[string]any{
+		_, err = globalConfig.Patch(tx, map[string]string{
 			"oidc.scopes": strings.Join(oidcScopes, " "),
 		})
 
@@ -1521,7 +1528,7 @@ func patchRemoveBackupsImagesSymlinks(_ string, d *Daemon) error {
 
 // If storage.images_volume is set, move images into an `images` subfolder.
 func patchMoveBackupsImagesStorage(name string, d *Daemon) error {
-	moveStorage := func(destPath string) error {
+	moveStorage := func(storageType config.DaemonStorageType, destPath string) error {
 		sourcePath, dirName := filepath.Split(destPath)
 
 		err := os.MkdirAll(destPath, 0700)
@@ -1541,7 +1548,7 @@ func patchMoveBackupsImagesStorage(name string, d *Daemon) error {
 
 			oldPath := filepath.Join(sourcePath, item.Name())
 			newPath := filepath.Join(destPath, item.Name())
-			logger.Debugf("Moving backup from %q to %q", oldPath, newPath)
+			logger.Debugf("Moving %s from %q to %q", storageType, oldPath, newPath)
 			err = os.Rename(oldPath, newPath)
 			if err != nil {
 				return fmt.Errorf("Failed moving file from %q to %q: %w", oldPath, newPath, err)
@@ -1551,21 +1558,251 @@ func patchMoveBackupsImagesStorage(name string, d *Daemon) error {
 		return nil
 	}
 
-	if d.localConfig.StorageImagesVolume() != "" {
-		err := moveStorage(d.State().ImagesStoragePath())
+	if d.localConfig.StorageImagesVolume("") != "" {
+		err := moveStorage(config.DaemonStorageTypeImages, d.State().ImagesStoragePath(""))
 		if err != nil {
 			return err
 		}
 	}
 
-	if d.localConfig.StorageBackupsVolume() != "" {
-		err := moveStorage(d.State().BackupsStoragePath())
+	if d.localConfig.StorageBackupsVolume("") != "" {
+		err := moveStorage(config.DaemonStorageTypeBackups, d.State().BackupsStoragePath(""))
 		if err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// patchClusterConfigVolatileUUID checks if the clusterUUID is defined and if not, generates a new v7 UUID and saves it
+// to the `config` table under `volatile.uuid`. Note that this means existing deployments will have a 'volatile.uuid'
+// that does not match the contents of `$LXD_DIR/server.uuid`, whereas new deployments will have a 'volatile.uuid' that
+// matches the contents of 'server.uuid' on the member that initially bootstrapped the cluster.
+func patchClusterConfigVolatileUUID(name string, d *Daemon) error {
+	return d.db.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		// Get current configuration.
+		globalConfig, err := clusterConfig.Load(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		// If the cluster UUID has been set, return.
+		if globalConfig.ClusterUUID() != "" {
+			return nil
+		}
+
+		clusterUUID, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("Failed to generate a cluster UUID: %w", err)
+		}
+
+		// Otherwise, insert the server UUID into the database.
+		_, err = tx.Tx().Exec(`INSERT INTO config (key, value) VALUES ('volatile.uuid', ?)`, clusterUUID.String())
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+// patchUpdatePowerFlexCloneCopySetting checks whether or not the 'powerflex.clone_copy' setting is present on any applicable storage pool.
+// If set it's getting replaced with the new 'powerflex.snapshot_copy' setting which also inverts the original value.
+func patchUpdatePowerFlexCloneCopySetting(_ string, d *Daemon) error {
+	err := d.State().DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		var err error
+
+		// Get all storage pool names.
+		pools, _, err := tx.GetStoragePools(ctx, nil)
+		if err != nil {
+			// Skip the rest of the patch if no storage pools were found.
+			if api.StatusErrorCheck(err, http.StatusNotFound) {
+				return nil
+			}
+
+			return err
+		}
+
+		for _, pool := range pools {
+			// Skip all pools which don't use the powerflex driver.
+			if pool.Driver != "powerflex" {
+				continue
+			}
+
+			if pool.Config["powerflex.clone_copy"] != "" {
+				if shared.IsFalse(pool.Config["powerflex.clone_copy"]) {
+					pool.Config["powerflex.snapshot_copy"] = "true"
+				} else if shared.IsTrue(pool.Config["powerflex.clone_copy"]) {
+					pool.Config["powerflex.snapshot_copy"] = "false"
+				}
+
+				// Delete the old config key.
+				delete(pool.Config, "powerflex.clone_copy")
+
+				// Persist the changes.
+				err = tx.UpdateStoragePool(ctx, pool.Name, pool.Description, pool.Config)
+				if err != nil {
+					return fmt.Errorf("Failed updating storage pool %q: %w", pool.Name, err)
+				}
+			}
+		}
+
+		return nil
+	})
+
+	return err
+}
+
+// patchUpdatePowerFlexSnapshotPrefix adds the snapshot prefix to snapshots which actually belong to
+// LXD volumes and were not created through the powerflex.snapshot_copy=true setting.
+func patchUpdatePowerFlexSnapshotPrefix(_ string, d *Daemon) error {
+	s := d.State()
+
+	isSelectedPatchMember, err := selectedPatchClusterMember(s)
+	if err != nil {
+		return err
+	}
+
+	// Only run the patch on the selected member to ensure the change is only ever performed once on the
+	// remote storage which is shared across all cluster members.
+	if !isSelectedPatchMember {
+		return nil
+	}
+
+	// Cache a list of snapshots, by pool and volume.
+	poolVolumesSnapshots := make(map[string]map[*db.StorageVolume][]db.StorageVolumeArgs)
+
+	err = d.State().DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		var err error
+
+		// Get all storage pool names.
+		pools, _, err := tx.GetStoragePools(ctx, nil)
+		if err != nil {
+			// Skip the rest of the patch if no storage pools were found.
+			if api.StatusErrorCheck(err, http.StatusNotFound) {
+				return nil
+			}
+
+			return err
+		}
+
+		for poolID, pool := range pools {
+			// Skip all pools which don't use the powerflex driver.
+			if pool.Driver != "powerflex" {
+				continue
+			}
+
+			poolVolumesSnapshots[pool.Name] = make(map[*db.StorageVolume][]db.StorageVolumeArgs)
+
+			volumes, err := tx.GetStorageVolumes(ctx, false, db.StorageVolumeFilter{PoolID: &poolID})
+			if err != nil {
+				return fmt.Errorf("Failed getting storage volumes for pool %q: %w", pool.Name, err)
+			}
+
+			for _, volume := range volumes {
+				volType, err := dbCluster.StoragePoolVolumeTypeFromName(volume.Type)
+				if err != nil {
+					return err
+				}
+
+				snapshots, err := tx.GetLocalStoragePoolVolumeSnapshotsWithType(ctx, volume.Project, volume.Name, volType, poolID)
+				if err != nil {
+					return err
+				}
+
+				poolVolumesSnapshots[pool.Name][volume] = snapshots
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// Iterate over the pools, volumes and snapshots.
+	for poolName, volumesSnapshots := range poolVolumesSnapshots {
+		p, err := storagePools.LoadByName(s, poolName)
+		if err != nil {
+			return fmt.Errorf("Failed loading pool %q: %w", poolName, err)
+		}
+
+		var snapVols []storageDrivers.Volume
+
+		for volume, snapshots := range volumesSnapshots {
+			for _, snapshot := range snapshots {
+				snapshotName := storageDrivers.GetSnapshotVolumeName(volume.Name, snapshot.Name)
+				snapshotStorageName := project.StorageVolume(volume.Project, snapshotName)
+
+				dbVolType, err := dbCluster.StoragePoolVolumeTypeFromName(volume.Type)
+				if err != nil {
+					return err
+				}
+
+				// Get the right storage level volume type.
+				// The volume might either be a container, VM or custom snapshot.
+				volType := storagePools.VolumeDBTypeToType(dbVolType)
+
+				snapVol := storageDrivers.NewVolume(p.Driver(), p.Name(), volType, storageDrivers.ContentType(volume.ContentType), snapshotStorageName, snapshot.Config, p.ToAPI().Config)
+				snapVols = append(snapVols, snapVol)
+			}
+		}
+
+		// Invoke the driver level patch function.
+		// We are passing a list of volumes which require patching the snapshot prefix.
+		err = storageDrivers.PatchUpdatePowerFlexSnapshotPrefix(p.Driver(), snapVols)
+		if err != nil {
+			return fmt.Errorf("Failed patching volume snapshot prefixes on pool %q: %w", poolName, err)
+		}
+	}
+
+	return nil
+}
+
+// patchRemoveInstancesPlacementScriptlet removes the 'instances.placement.scriptlet' config key from the cluster.
+// If the key is set, its value is copied to 'user.instances.placement.scriptlet'.
+func patchRemoveInstancesPlacementScriptlet(name string, d *Daemon) error {
+	s := d.State()
+	return s.DB.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		config, err := tx.Config(ctx)
+		if err != nil {
+			return err
+		}
+
+		const oldKey = "instances.placement.scriptlet"
+		const newKey = "user.instances.placement.scriptlet"
+
+		oldVal, ok := config[oldKey]
+		if !ok || oldVal == "" {
+			return nil
+		}
+
+		updates := map[string]string{
+			oldKey: "",
+		}
+
+		if config[newKey] == "" {
+			updates[newKey] = oldVal
+		}
+
+		return tx.UpdateClusterConfig(updates)
+	})
+}
+
+func patchEventEntitlementNames(name string, d *Daemon) error {
+	s := d.State()
+	return s.DB.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
+		q := `UPDATE auth_groups_permissions SET entitlement = ? WHERE entitlement = ? AND entity_type = ?`
+
+		// Rename `can_view_privileged_events` on `server` to `can_view_events`.
+		_, err := tx.Tx().ExecContext(ctx, q, auth.EntitlementCanViewEvents, "can_view_privileged_events", dbCluster.EntityType(entity.TypeServer))
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
 }
 
 // Patches end here

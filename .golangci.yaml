@@ -88,16 +88,16 @@ linters:
         - float-compare
         - require-error
   exclusions:
+    # Flag unused exclusions rules
+    warn-unused: true
     generated: lax
-    paths:
-      - third_party$
-      - builtin$
-      - examples$
-      - lxd/idmap/idmapset_linux\.go$
     rules:
       - linters:
           - staticcheck
         text: "ST1005:" # ST1005: error strings should not be capitalized (5585 occurences as of 2023-10-20)
+      - linters:
+          - revive
+        text: "var-naming: avoid meaningless package names"
 formatters:
   enable:
     - gci
@@ -108,9 +108,3 @@ formatters:
         - standard
         - default
         - prefix(github.com/canonical/lxd)
-  exclusions:
-    generated: lax
-    paths:
-      - third_party$
-      - builtin$
-      - examples$

@@ -181,17 +181,26 @@ linkcheck_ignore = [
     'https://www.dell.com/',
     'https://www.dell.com/en-us/shop/powerflex/sf/powerflex',
     'https://www.gnu.org/licenses/agpl-3.0.en.html',
-    # 403 from GH runners
+    r"https://ceph\.io(/.*)?",
+    # Blocked from GH runners
     'https://www.schlachter.tech/solutions/pongo2-template-engine/',
-    ]
+    r"https://.*\.sourceforge\.net/.*",
+    'https://www.hpe.com/emea_europe/en/hpe-alletra.html',
+    r'https://.*canonical\.com/.*',
+    r'https://snapcraft\.io/.*',
+    r'https://ubuntu\.com/.*',
+    r'https://bugs\.launchpad\.net/.*',
+    r'https://microcloud\.is/.*',
+]
 
 # Pages on which to ignore anchors
 # (This list will be appended to linkcheck_anchors_ignore_for_url)
 
 custom_linkcheck_anchors_ignore_for_url = [
     r'https://snapcraft\.io/docs/.*',
-    'https://docs.docker.com/network/packet-filtering-firewalls/'
-    ]
+    'https://docs.docker.com/network/packet-filtering-firewalls/',
+    'https://maas.io/docs/how-to-manage-machines'
+]
 
 linkcheck_exclude_documents = [r'.*/manpages/.*']
 

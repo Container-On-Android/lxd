@@ -2,8 +2,10 @@ github.com/armon/go-proxyproto
 github.com/canonical/lxd/client
 github.com/canonical/lxd/lxd-agent/api
 github.com/canonical/lxd/lxd/auth
+github.com/canonical/lxd/lxd/certificate
 github.com/canonical/lxd/lxd/db/operationtype
 github.com/canonical/lxd/lxd/device/config
+github.com/canonical/lxd/lxd/device/filters
 github.com/canonical/lxd/lxd/endpoints/listeners
 github.com/canonical/lxd/lxd/events
 github.com/canonical/lxd/lxd/identity
@@ -64,6 +66,7 @@ github.com/vishvananda/netlink
 github.com/vishvananda/netlink/nl
 github.com/vishvananda/netns
 github.com/zitadel/logging
+github.com/zitadel/oidc/v3/internal/otel
 github.com/zitadel/oidc/v3/pkg/client
 github.com/zitadel/oidc/v3/pkg/client/rp
 github.com/zitadel/oidc/v3/pkg/crypto
@@ -83,11 +86,12 @@ go.opentelemetry.io/otel/internal/global
 go.opentelemetry.io/otel/metric
 go.opentelemetry.io/otel/metric/embedded
 go.opentelemetry.io/otel/propagation
-go.opentelemetry.io/otel/semconv/v1.26.0
+go.opentelemetry.io/otel/semconv/v1.37.0
 go.opentelemetry.io/otel/trace
 go.opentelemetry.io/otel/trace/embedded
 go.opentelemetry.io/otel/trace/internal/telemetry
 go.opentelemetry.io/otel/trace/noop
+go.yaml.in/yaml/v2
 golang.org/x/crypto/blowfish
 golang.org/x/crypto/chacha20
 golang.org/x/crypto/curve25519
@@ -111,7 +115,6 @@ golang.org/x/text/internal/tag
 golang.org/x/text/language
 golang.org/x/text/transform
 golang.org/x/text/unicode/norm
-gopkg.in/yaml.v2
 vendor/golang.org/x/crypto/chacha20
 vendor/golang.org/x/crypto/chacha20poly1305
 vendor/golang.org/x/crypto/cryptobyte

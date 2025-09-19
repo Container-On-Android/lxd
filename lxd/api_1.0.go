@@ -12,6 +12,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/auth"
@@ -21,13 +22,14 @@ import (
 	clusterConfig "github.com/canonical/lxd/lxd/cluster/config"
 	"github.com/canonical/lxd/lxd/config"
 	"github.com/canonical/lxd/lxd/db"
+	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
 	instanceDrivers "github.com/canonical/lxd/lxd/instance/drivers"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/node"
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
-	scriptletLoad "github.com/canonical/lxd/lxd/scriptlet/load"
+	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
@@ -139,6 +141,9 @@ var api10 = []APIEndpoint{
 	oidcIdentityCmd,
 	tlsIdentitiesCmd,
 	oidcIdentitiesCmd,
+	bearerIdentitiesCmd,
+	bearerIdentityCmd,
+	bearerIdentityTokenCmd,
 	authGroupsCmd,
 	authGroupCmd,
 	identityProviderGroupsCmd,
@@ -244,13 +249,27 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 		APIStatus:         "stable",
 		APIVersion:        version.APIVersion,
 		Public:            false,
-		Auth:              "untrusted",
+		Auth:              api.AuthUntrusted,
 		AuthMethods:       authMethods,
 		ClientCertificate: r.TLS != nil && len(r.TLS.PeerCertificates) > 0,
 	}
 
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	// If not authenticated, return now.
-	if !auth.IsTrusted(r.Context()) {
+	if !requestor.IsTrusted() {
+		daemonConfig, _ := daemonConfigRender(s)
+		_, flagExists := daemonConfig["user.microcloud"]
+		if flagExists {
+			// Unprivileged users may see the user.microcloud config key
+			srv.Config = map[string]any{
+				"user.microcloud": daemonConfig["user.microcloud"],
+			}
+		}
+
 		return response.SyncResponseETag(true, srv, nil)
 	}
 
@@ -266,7 +285,7 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	srv.Auth = "trusted"
+	srv.Auth = api.AuthTrusted
 
 	localHTTPSAddress := s.LocalConfig.HTTPSAddress()
 
@@ -411,23 +430,28 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 
 	fullSrv := &api.Server{ServerUntrusted: srv}
 	fullSrv.Environment = env
-	requestor := request.CreateRequestor(r.Context())
-	fullSrv.AuthUserName = requestor.Username
-	fullSrv.AuthUserMethod = requestor.Protocol
+	fullSrv.AuthUserName = requestor.CallerUsername()
+	fullSrv.AuthUserMethod = requestor.CallerProtocol()
 
 	// Only allow identities that can edit configuration to view it as sensitive information may be stored there.
 	err = s.Authorizer.CheckPermission(r.Context(), entity.ServerURL(), auth.EntitlementCanEdit)
 	if err != nil && !auth.IsDeniedError(err) {
 		return response.SmartError(err)
 	} else if err == nil {
-		fullSrv.Config, err = daemonConfigRender(s)
+		daemonConfig, err := daemonConfigRender(s)
 		if err != nil {
 			return response.InternalError(err)
+		}
+
+		// Convert the internal map[string]string config to the API format of map[string]any.
+		fullSrv.Config = make(map[string]any, len(daemonConfig))
+		for key, value := range daemonConfig {
+			fullSrv.Config[key] = value
 		}
 	}
 
 	if len(withEntitlements) > 0 {
-		err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeServer, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.ServerURL(): fullSrv})
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeServer, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.ServerURL(): fullSrv})
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -489,9 +513,14 @@ func api10Put(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	// If this is a notification from a cluster node, just run the triggers
 	// for reacting to the values that changed.
-	if isClusterNotification(r) {
+	if requestor.IsClusterNotification() {
 		logger.Debug("Handling config changed notification")
 		changed := make(map[string]string)
 		for key, value := range req.Config {
@@ -516,10 +545,8 @@ func api10Put(d *Daemon, r *http.Request) response.Response {
 
 		// Copy the old config so that the update triggers have access to it.
 		// In this case it will not be used as we are not changing any node values.
-		oldNodeConfig := make(map[string]any)
-		for k, v := range s.LocalConfig.Dump() {
-			oldNodeConfig[k] = v
-		}
+		oldNodeConfig := make(map[string]string)
+		maps.Copy(oldNodeConfig, s.LocalConfig.Dump())
 
 		// Run any update triggers.
 		err = doAPI10UpdateTriggers(d, nil, changed, oldNodeConfig, s.LocalConfig, config)
@@ -613,23 +640,147 @@ func api10Patch(d *Daemon, r *http.Request) response.Response {
 	return doAPI10Update(d, r, req, true)
 }
 
+func validateStorageVolumes(s *state.State, ctx context.Context, nodeValues map[string]string, oldNodeConfig map[string]string, newNodeConfig *node.Config) error {
+	var err error
+	projectsImagesStorage := make(map[string]string)
+	projectsBackupsStorage := make(map[string]string)
+	for key, value := range nodeValues {
+		if !strings.HasPrefix(key, "storage.") {
+			continue
+		}
+
+		// Validate the storage volume.
+		if nodeValues[key] != oldNodeConfig[key] {
+			// Store validated name back into nodeValues to ensure its not classifed as raw user input.
+			nodeValues[key], err = daemonStorageValidate(s, nodeValues[key])
+			if err != nil {
+				return fmt.Errorf("Failed validation of %q: %w", key, err)
+			}
+		}
+
+		// Validate project storage settings.
+		projectName, _ := config.ParseDaemonStorageConfigKey(key)
+		if projectName == "" {
+			continue
+		}
+
+		var project *api.Project
+		err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+			dbProject, err := dbCluster.GetProject(ctx, tx.Tx(), projectName)
+			if err != nil {
+				return err
+			}
+
+			project, err = dbProject.ToAPI(ctx, tx.Tx())
+			if err != nil {
+				return err
+			}
+
+			project.UsedBy, err = projectUsedBy(ctx, tx, dbProject)
+			return err
+		})
+		if err != nil {
+			return fmt.Errorf("Failed loading project %q: %w", projectName, err)
+		}
+
+		// Disallow setting external storage on non-empty projects.
+		if nodeValues[key] != oldNodeConfig[key] && isProjectInUse(project.UsedBy) {
+			return fmt.Errorf("Project config %q cannot be changed on non-empty projects", key)
+		}
+
+		// Disallow setting external storage for images on projects without images.
+		if strings.HasSuffix(key, ".images_volume") && shared.IsFalseOrEmpty(project.Config["features.images"]) {
+			return fmt.Errorf("Project %q doesn't have `features.images` set, so it cannot have images storage configured", project)
+		}
+
+		// Don't allow setting the project storage the same as as the daemon-level storage volume.
+		if value != "" && strings.HasSuffix(key, ".images_volume") {
+			if value == newNodeConfig.StorageImagesVolume("") {
+				return fmt.Errorf(`Failed validation of %q: storage volume already configured as the daemon images storage`, key)
+			}
+
+			projectsImagesStorage[value] = projectName
+		}
+
+		if value != "" && strings.HasSuffix(key, ".backups_volume") {
+			if value == newNodeConfig.StorageBackupsVolume("") {
+				return fmt.Errorf(`Failed validation of %q: storage volume already configured as the daemon backups storage`, key)
+			}
+
+			projectsBackupsStorage[value] = projectName
+		}
+	}
+
+	// Don't allow the daemon-level storage to be set the same as any of the project settings.
+	if nodeValues["storage.backups_volume"] != "" && nodeValues["storage.backups_volume"] != newNodeConfig.StorageBackupsVolume("") {
+		volume := nodeValues["storage.backups_volume"]
+		if projectsBackupsStorage[volume] != "" {
+			return fmt.Errorf(`Failed validation of %q: storage volume already configured as backups storage of project %q`, "storage.backups_volume", projectsBackupsStorage[nodeValues["storage.backups_volume"]])
+		}
+	}
+
+	if nodeValues["storage.images_volume"] != "" && nodeValues["storage.images_volume"] != newNodeConfig.StorageImagesVolume("") {
+		volume := nodeValues["storage.images_volume"]
+		if projectsImagesStorage[volume] != "" {
+			return fmt.Errorf(`Failed validation of %q: storage volume already configured as images storage of project %q`, "storage.images_volume", projectsImagesStorage[nodeValues["storage.images_volume"]])
+		}
+	}
+
+	return nil
+}
+
 func doAPI10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) response.Response {
 	s := d.State()
 
+	// Convert the request config to a map[string]string.
+	stringReqConfig := make(map[string]string, len(req.Config))
+	for key, value := range req.Config {
+		var ok bool
+		stringReqConfig[key], ok = value.(string)
+		if !ok {
+			return response.BadRequest(fmt.Errorf("Unexpected type for %q: %T", key, value))
+		}
+	}
+
+	// Validate the cluster UUID has not been changed.
+	clusterUUID := s.GlobalConfig.ClusterUUID()
+	receivedClusterUUID, ok := stringReqConfig["volatile.uuid"]
+
+	// If present, it must be identical (for both PUT and PATCH requests).
+	if ok {
+		if receivedClusterUUID != clusterUUID {
+			return response.BadRequest(errors.New("The cluster UUID cannot be changed"))
+		}
+	} else if !patch {
+		// If not present, this is allowed for PATCH but not for PUT.
+		return response.BadRequest(errors.New("The cluster UUID cannot be changed"))
+	}
+
 	// First deal with config specific to the local daemon
-	nodeValues := map[string]any{}
+	nodeValues := map[string]string{}
 
 	for key := range node.ConfigSchema {
-		value, ok := req.Config[key]
+		value, ok := stringReqConfig[key]
 		if ok {
 			nodeValues[key] = value
-			delete(req.Config, key)
+			delete(stringReqConfig, key)
+		}
+	}
+
+	// The config load validation has to allow loading of arbitrary per-project `storage.project.{name}` keys,
+	// as the list of projects is stored in the cluster database which is not available at the time when node
+	// config is loaded from the local database.
+	// In order not to allow setting any of these arbitrary values, we disallow that for those which were not
+	// explicitly added to the ConfigSchema above here.
+	for key := range stringReqConfig {
+		if config.IsProjectStorageConfig(key) {
+			return response.BadRequest(fmt.Errorf("Cannot set %q: Unknown key", key))
 		}
 	}
 
 	nodeChanged := map[string]string{}
 	var newNodeConfig *node.Config
-	oldNodeConfig := make(map[string]any)
+	oldNodeConfig := make(map[string]string)
 
 	err := s.DB.Node.Transaction(r.Context(), func(ctx context.Context, tx *db.NodeTx) error {
 		var err error
@@ -651,7 +802,7 @@ func doAPI10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 			newClusterHTTPSAddress := ""
 			newClusterHTTPSAddressAny, found := nodeValues["cluster.https_address"]
 			if found {
-				newClusterHTTPSAddress, _ = newClusterHTTPSAddressAny.(string)
+				newClusterHTTPSAddress = newClusterHTTPSAddressAny
 			} else if patch {
 				newClusterHTTPSAddress = curConfig["cluster.https_address"]
 			}
@@ -661,31 +812,10 @@ func doAPI10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 			}
 		}
 
-		// Validate the storage volumes
-		if nodeValues["storage.backups_volume"] != nil && nodeValues["storage.backups_volume"] != newNodeConfig.StorageBackupsVolume() {
-			backupsPoolVolume, ok := nodeValues["storage.backups_volume"].(string)
-			if !ok {
-				return fmt.Errorf(`Unexpected type for "storage.backups_volume": %T`, nodeValues["storage.backups_volume"])
-			}
-
-			// Store validated name back into nodeValues to ensure its not classifed as raw user input.
-			nodeValues["storage.backups_volume"], err = daemonStorageValidate(s, backupsPoolVolume)
-			if err != nil {
-				return fmt.Errorf("Failed validation of %q: %w", "storage.backups_volume", err)
-			}
-		}
-
-		if nodeValues["storage.images_volume"] != nil && nodeValues["storage.images_volume"] != newNodeConfig.StorageImagesVolume() {
-			imagesPoolVolume, ok := nodeValues["storage.images_volume"].(string)
-			if !ok {
-				return fmt.Errorf(`Unexpected type for "storage.images_volume": %T`, nodeValues["storage.images_volume"])
-			}
-
-			// Store validated name back into nodeValues to ensure its not classifed as raw user input.
-			nodeValues["storage.images_volume"], err = daemonStorageValidate(s, imagesPoolVolume)
-			if err != nil {
-				return fmt.Errorf("Failed validation of %q: %w", "storage.images_volume", err)
-			}
+		// Validate the storage volumes.
+		err = validateStorageVolumes(s, r.Context(), nodeValues, oldNodeConfig, newNodeConfig)
+		if err != nil {
+			return fmt.Errorf("Failed validating storage volumes: %w", err)
 		}
 
 		if patch {
@@ -712,7 +842,7 @@ func doAPI10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 		for key := range nodeValues {
 			val, ok := oldNodeConfig[key]
 			if !ok {
-				nodeValues[key] = nil
+				nodeValues[key] = ""
 			} else {
 				nodeValues[key] = val
 			}
@@ -740,7 +870,7 @@ func doAPI10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 	// Then deal with cluster wide configuration
 	var clusterChanged map[string]string
 	var newClusterConfig *clusterConfig.Config
-	var oldClusterConfig map[string]any
+	var oldClusterConfig map[string]string
 
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
@@ -753,9 +883,9 @@ func doAPI10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 		oldClusterConfig = newClusterConfig.Dump()
 
 		if patch {
-			clusterChanged, err = newClusterConfig.Patch(req.Config)
+			clusterChanged, err = newClusterConfig.Patch(tx, stringReqConfig)
 		} else {
-			clusterChanged, err = newClusterConfig.Replace(req.Config)
+			clusterChanged, err = newClusterConfig.Replace(tx, stringReqConfig)
 		}
 
 		return err
@@ -770,12 +900,12 @@ func doAPI10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 	}
 
 	revert.Add(func() {
-		for key := range req.Config {
+		for key := range stringReqConfig {
 			val, ok := oldClusterConfig[key]
 			if !ok {
-				req.Config[key] = nil
+				stringReqConfig[key] = ""
 			} else {
-				req.Config[key] = val
+				stringReqConfig[key] = val
 			}
 		}
 
@@ -785,7 +915,7 @@ func doAPI10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 				return fmt.Errorf("Failed to load cluster config: %w", err)
 			}
 
-			_, err = newClusterConfig.Replace(req.Config)
+			_, err = newClusterConfig.Replace(tx, stringReqConfig)
 			if err != nil {
 				return fmt.Errorf("Failed updating cluster config: %w", err)
 			}
@@ -838,12 +968,12 @@ func doAPI10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 
 	revert.Success()
 
-	s.Events.SendLifecycle(api.ProjectDefaultName, lifecycle.ConfigUpdated.Event(request.CreateRequestor(r.Context()), nil))
+	s.Events.SendLifecycle("", lifecycle.ConfigUpdated.Event(request.CreateRequestor(r.Context()), nil))
 
 	return response.EmptySyncResponse
 }
 
-func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]string, oldNodeConfig map[string]any, newNodeConfig *node.Config, newClusterConfig *clusterConfig.Config) error {
+func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]string, oldNodeConfig map[string]string, newNodeConfig *node.Config, newClusterConfig *clusterConfig.Config) error {
 	s := d.State()
 
 	maasChanged := false
@@ -912,6 +1042,7 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		}
 	}
 
+	projectVolumeConfigKeys := make([]string, 0)
 	for key := range nodeChanged {
 		switch key {
 		case "maas.machine":
@@ -924,6 +1055,11 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 			dnsChanged = true
 		case "core.syslog_socket":
 			syslogSocketChanged = true
+		default:
+			projectName, _ := config.ParseDaemonStorageConfigKey(key)
+			if projectName != "" {
+				projectVolumeConfigKeys = append(projectVolumeConfigKeys, key)
+			}
 		}
 	}
 
@@ -978,8 +1114,8 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 
 	value, ok = nodeChanged["storage.backups_volume"]
 	if ok {
-		oldValue, _ := oldNodeConfig["storage.backups_volume"].(string)
-		err := daemonStorageMove(s, "backups", oldValue, value)
+		oldValue := oldNodeConfig["storage.backups_volume"]
+		err := daemonStorageMove(s, config.DaemonStorageTypeBackups, oldValue, value)
 		if err != nil {
 			return err
 		}
@@ -987,10 +1123,19 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 
 	value, ok = nodeChanged["storage.images_volume"]
 	if ok {
-		oldValue, _ := oldNodeConfig["storage.images_volume"].(string)
-		err := daemonStorageMove(s, "images", oldValue, value)
+		oldValue := oldNodeConfig["storage.images_volume"]
+		err := daemonStorageMove(s, config.DaemonStorageTypeImages, oldValue, value)
 		if err != nil {
 			return err
+		}
+	}
+
+	for _, projectVolumeConfigKey := range projectVolumeConfigKeys {
+		oldValue := oldNodeConfig[projectVolumeConfigKey]
+		_, storageType := config.ParseDaemonStorageConfigKey(projectVolumeConfigKey)
+		err := projectStorageVolumeChange(s, oldValue, nodeChanged[projectVolumeConfigKey], storageType)
+		if err != nil {
+			return fmt.Errorf("Failed setting node config %q: %w", projectVolumeConfigKey, err)
 		}
 	}
 
@@ -1047,15 +1192,6 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		}
 	}
 
-	// Compile and load the instance placement scriptlet.
-	value, ok = clusterChanged["instances.placement.scriptlet"]
-	if ok {
-		err := scriptletLoad.InstancePlacementSet(value)
-		if err != nil {
-			return fmt.Errorf("Failed saving instance placement scriptlet: %w", err)
-		}
-	}
-
 	if oidcChanged {
 		oidcIssuer, oidcClientID, oidcClientSecret, oidcScopes, oidcAudience, oidcGroupsClaim := newClusterConfig.OIDCServer()
 
@@ -1068,7 +1204,7 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 				return util.HTTPClient("", d.proxy)
 			}
 
-			d.oidcVerifier, err = oidc.NewVerifier(oidcIssuer, oidcClientID, oidcClientSecret, oidcScopes, oidcAudience, s.ServerCert, d.identityCache, httpClientFunc, &oidc.Opts{GroupsClaim: oidcGroupsClaim})
+			d.oidcVerifier, err = oidc.NewVerifier(oidcIssuer, oidcClientID, oidcClientSecret, oidcScopes, oidcAudience, s.CoreAuthSecrets, d.identityCache, httpClientFunc, &oidc.Opts{GroupsClaim: oidcGroupsClaim})
 			if err != nil {
 				return fmt.Errorf("Failed creating verifier: %w", err)
 			}

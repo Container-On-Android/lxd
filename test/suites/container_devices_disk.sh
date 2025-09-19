@@ -1,6 +1,5 @@
 test_container_devices_disk() {
   ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   lxc init testimage foo
 
@@ -10,6 +9,7 @@ test_container_devices_disk() {
   _container_devices_disk_cephfs
   _container_devices_disk_socket
   _container_devices_disk_char
+  _container_devices_disk_patch
 
   lxc delete foo
 }
@@ -183,4 +183,25 @@ _container_devices_disk_char() {
   [ "$(lxc exec foo -- stat /root/zero -c '%F')" = "character special file" ]
   lxc config device remove foo char
   lxc stop foo -f
+}
+
+_container_devices_disk_patch() {
+  # Ensure no devices are present.
+  [ "$(lxc config device list foo)" = "" ]
+
+  # Ensure a new device is added.
+  lxc query -X PATCH /1.0/instances/foo -d '{\"devices\": {\"tmp\": {\"type\": \"disk\", \"source\": \"/etc/os-release\", \"path\": \"/tmp/release\"}}}'
+  [ "$(lxc config device list foo)" = "tmp" ]
+
+  # Ensure the device is updated.
+  lxc query -X PATCH /1.0/instances/foo -d '{\"devices\": {\"tmp\": {\"type\": \"disk\", \"source\": \"/etc/os-release\", \"path\": \"/tmp/release-new\"}}}'
+  [ "$(lxc config device get foo tmp path)" = "/tmp/release-new" ]
+
+  # Ensure the device is not removed when patching with an empty devices object.
+  lxc query -X PATCH /1.0/instances/foo -d '{\"devices\": {}}'
+  [ "$(lxc config device list foo)" = "tmp" ]
+
+  # Ensure the device is removed when patching with a null device.
+  lxc query -X PATCH /1.0/instances/foo -d '{\"devices\": {\"tmp\": null }}'
+  [ "$(lxc config device list foo)" = "" ]
 }

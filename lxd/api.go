@@ -13,10 +13,9 @@ import (
 	"github.com/gorilla/mux"
 
 	clusterConfig "github.com/canonical/lxd/lxd/cluster/config"
-	"github.com/canonical/lxd/lxd/cluster/request"
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/metrics"
-	lxdRequest "github.com/canonical/lxd/lxd/request"
+	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
 	storagePools "github.com/canonical/lxd/lxd/storage"
 	"github.com/canonical/lxd/lxd/storage/s3"
@@ -108,7 +107,9 @@ func restServer(d *Daemon) *http.Server {
 			w.Header().Set("Content-Type", "text/html")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, err := fmt.Fprint(w, errorMessage)
-			logger.Warn("Failed sending error message to client", logger.Ctx{"url": r.URL, "method": r.Method, "remote": r.RemoteAddr, "err": err})
+			if err != nil {
+				logger.Warn("Failed sending error message to client", logger.Ctx{"url": r.URL, "method": r.Method, "remote": r.RemoteAddr, "err": err})
+			}
 		})
 		mux.PathPrefix("/ui").Handler(uiHandlerErrorUINotEnabled)
 	}
@@ -169,11 +170,11 @@ func restServer(d *Daemon) *http.Server {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		ua := r.Header.Get("User-Agent")
-		if strings.Contains(ua, "Gecko") {
+		if isBrowserClient(r) {
 			http.Redirect(w, r, "/ui/", http.StatusMovedPermanently)
 			return
 		}
+
 		// Normal client handling.
 		_ = response.SyncResponse(true, []string{"/1.0"}).Render(w, r)
 	})
@@ -221,8 +222,14 @@ func restServer(d *Daemon) *http.Server {
 
 	return &http.Server{
 		Handler:     &lxdHTTPServer{r: mux, d: d},
-		ConnContext: lxdRequest.SaveConnectionInContext,
+		ConnContext: request.SaveConnectionInContext,
 	}
+}
+
+// isBrowserClient checks if the request is coming from a browser client.
+func isBrowserClient(r *http.Request) bool {
+	// Check if the User-Agent starts with "Mozilla" which is common for browsers.
+	return strings.HasPrefix(r.Header.Get("User-Agent"), "Mozilla")
 }
 
 func metricsServer(d *Daemon) *http.Server {
@@ -437,13 +444,6 @@ func setCORSHeaders(rw http.ResponseWriter, req *http.Request, config *clusterCo
 	if allowedCredentials {
 		rw.Header().Set("Access-Control-Allow-Credentials", "true")
 	}
-}
-
-// Return true if this an API request coming from a cluster node that is
-// notifying us of some user-initiated API request that needs some action to be
-// taken on this node as well.
-func isClusterNotification(r *http.Request) bool {
-	return r.Header.Get("User-Agent") == request.UserAgentNotifier
 }
 
 type uiHTTPDir struct {

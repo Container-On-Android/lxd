@@ -4,8 +4,8 @@ import (
 	"net"
 
 	"github.com/canonical/lxd/lxd/cluster"
-	"github.com/canonical/lxd/lxd/cluster/request"
 	"github.com/canonical/lxd/lxd/db"
+	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
@@ -48,6 +48,8 @@ type Network interface {
 	Create(clientType request.ClientType) error
 	Start() error
 	Stop() error
+	Evacuate() error
+	Restore() error
 	Rename(name string) error
 	Update(newNetwork api.NetworkPut, targetNode string, clientType request.ClientType) error
 	HandleHeartbeat(heartbeatData *cluster.APIHeartbeat) error

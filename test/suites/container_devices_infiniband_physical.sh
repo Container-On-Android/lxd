@@ -8,9 +8,6 @@
 # echo "options mlx4_core num_vfs=4 probe_vf=4" | sudo tee /etc/modprobe.d/mellanox.conf
 # reboot
 test_container_devices_infiniband_physical() {
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
-
   parent=${LXD_IB_PHYSICAL_PARENT:-""}
 
   if [ "$parent" = "" ]; then
@@ -18,12 +15,15 @@ test_container_devices_infiniband_physical() {
     return
   fi
 
+  ensure_import_testimage
+  ensure_has_localhost_remote "${LXD_ADDR}"
+
   ctName="nt$$"
   macRand=$(shuf -i 0-9 -n 1)
   ctMAC="96:29:52:03:73:4b:81:e${macRand}"
 
   # Get host dev MAC to check MAC restore.
-  parentHostMAC=$(cat /sys/class/net/"${parent}"/address)
+  parentHostMAC=$(< /sys/class/net/"${parent}"/address)
 
   # Record how many nics we started with.
   startNicCount=$(find /sys/class/net | wc -l)

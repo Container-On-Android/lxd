@@ -7,11 +7,11 @@ import (
 
 	"github.com/canonical/lxd/lxd/backup"
 	backupConfig "github.com/canonical/lxd/lxd/backup/config"
-	"github.com/canonical/lxd/lxd/cluster/request"
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/instancewriter"
 	"github.com/canonical/lxd/lxd/migration"
 	"github.com/canonical/lxd/lxd/operations"
+	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/lxd/storage/drivers"
 	"github.com/canonical/lxd/lxd/storage/s3/miniod"
@@ -178,12 +178,22 @@ func (b *mockBackend) GenerateCustomVolumeBackupConfig(projectName string, volNa
 }
 
 // GenerateInstanceBackupConfig ...
-func (b *mockBackend) GenerateInstanceBackupConfig(inst instance.Instance, snapshots bool, op *operations.Operation) (*backupConfig.Config, error) {
+func (b *mockBackend) GenerateInstanceBackupConfig(inst instance.Instance, snapshots bool, volBackupConf *backupConfig.Config, op *operations.Operation) (*backupConfig.Config, error) {
+	return nil, nil
+}
+
+// GenerateInstanceCustomVolumeBackupConfig ...
+func (b *mockBackend) GenerateInstanceCustomVolumeBackupConfig(inst instance.Instance, cache *backupConfigCache, snapshots bool, op *operations.Operation) (*backupConfig.Config, error) {
 	return nil, nil
 }
 
 // UpdateInstanceBackupFile ...
-func (b *mockBackend) UpdateInstanceBackupFile(inst instance.Instance, snapshot bool, version uint32, op *operations.Operation) error {
+func (b *mockBackend) UpdateInstanceBackupFile(inst instance.Instance, snapshot bool, volBackupConf *backupConfig.Config, version uint32, op *operations.Operation) error {
+	return nil
+}
+
+// UpdateCustomVolumeBackupFiles ...
+func (b *mockBackend) UpdateCustomVolumeBackupFiles(projectName string, volName string, snapshots bool, instances []instance.Instance, op *operations.Operation) error {
 	return nil
 }
 
@@ -283,7 +293,7 @@ func (b *mockBackend) UpdateInstanceSnapshot(inst instance.Instance, newDesc str
 }
 
 // EnsureImage ...
-func (b *mockBackend) EnsureImage(fingerprint string, op *operations.Operation) error {
+func (b *mockBackend) EnsureImage(fingerprint string, op *operations.Operation, projectName string) error {
 	return nil
 }
 

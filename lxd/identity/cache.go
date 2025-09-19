@@ -35,6 +35,9 @@ type CacheEntry struct {
 
 	// Subject is optional. It is only set when AuthenticationMethod is api.AuthenticationMethodOIDC.
 	Subject string
+
+	// Secret is optional. It is required for identities with AuthenticationMethod set to api.AuthenticationMethodBearer
+	Secret []byte
 }
 
 // Get returns a single CacheEntry by its authentication method and identifier.
@@ -70,20 +73,23 @@ func (c *Cache) Get(authenticationMethod string, identifier string) (*CacheEntry
 }
 
 // GetByType returns a map of identifier to CacheEntry, where all entries have the given identity type.
-func (c *Cache) GetByType(identityType string) map[string]CacheEntry {
+func (c *Cache) GetByType(identityTypeStr string) map[string]CacheEntry {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	// Explicitly ignore the error here. It is expected that the caller will use the constants defined in shared/api.
-	authenticationMethod, _ := AuthenticationMethodFromIdentityType(identityType)
-	entriesByAuthMethod, ok := c.entries[authenticationMethod]
+	identityType, err := New(identityTypeStr)
+	if err != nil {
+		return nil
+	}
+
+	entriesByAuthMethod, ok := c.entries[identityType.AuthenticationMethod()]
 	if !ok {
 		return nil
 	}
 
 	entriesOfType := make(map[string]CacheEntry)
 	for _, entry := range entriesByAuthMethod {
-		if entry != nil && entry.IdentityType == identityType {
+		if entry != nil && entry.IdentityType == identityTypeStr {
 			entriesOfType[entry.Identifier] = *entry
 		}
 	}
@@ -127,6 +133,12 @@ func (c *Cache) ReplaceAll(entries []CacheEntry, idpGroups map[string][]string) 
 
 		if entry.AuthenticationMethod == api.AuthenticationMethodTLS && entry.Certificate == nil {
 			return fmt.Errorf("Identity cache entries of type %q must have a certificate", api.AuthenticationMethodTLS)
+		}
+
+		if entry.AuthenticationMethod == api.AuthenticationMethodBearer {
+			if len(entry.Secret) == 0 {
+				return fmt.Errorf("Identity cache entries of type %q must have a secret", api.AuthenticationMethodBearer)
+			}
 		}
 
 		_, ok := c.entries[entry.AuthenticationMethod]

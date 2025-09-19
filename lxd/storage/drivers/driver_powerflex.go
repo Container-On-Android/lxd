@@ -21,6 +21,10 @@ const powerFlexDefaultUser = "admin"
 // powerFlexDefaultSize represents the default PowerFlex volume size.
 const powerFlexDefaultSize = "8GiB"
 
+// powerFlexMinVolumeSizeBytes represents the minimal PowerFlex volume size in bytes.
+// This translates to 8 GiB.
+const powerFlexMinVolumeSizeBytes = 8589934592
+
 var powerflexSupportedConnectors = []string{
 	connectors.TypeNVME,
 	connectors.TypeSDC,
@@ -75,7 +79,7 @@ func (d *powerflex) load() error {
 // PowerFlex mode. The connector is cached in the driver struct.
 func (d *powerflex) connector() (connectors.Connector, error) {
 	if d.storageConnector == nil {
-		connector, err := connectors.NewConnector(d.config["powerflex.mode"], d.state.ServerUUID)
+		connector, err := connectors.NewConnector(d.config["powerflex.mode"], d.state.OS.ServerUUID)
 		if err != nil {
 			return nil, err
 		}
@@ -248,15 +252,15 @@ func (d *powerflex) Validate(config map[string]string) error {
 		//  shortdesc: Comma separated list of PowerFlex NVMe/TCP SDTs
 		//  scope: global
 		"powerflex.sdt": validate.Optional(validate.IsListOf(validate.IsNetworkAddress)),
-		// lxdmeta:generate(entities=storage-powerflex; group=pool-conf; key=powerflex.clone_copy)
-		// If this option is set to `true`, PowerFlex makes a non-sparse copy when creating a snapshot of an instance or custom volume.
+		// lxdmeta:generate(entities=storage-powerflex; group=pool-conf; key=powerflex.snapshot_copy)
+		// If this option is set to `true`, PowerFlex makes a sparse snapshot when copying an instance or custom volume.
 		// See {ref}`storage-powerflex-limitations` for more information.
 		// ---
 		//  type: bool
-		//  defaultdesc: `true`
-		//  shortdesc: Whether to use non-sparse copies for snapshots
+		//  defaultdesc: `false`
+		//  shortdesc: Whether to use sparse snapshots for copies
 		//  scope: global
-		"powerflex.clone_copy": validate.Optional(validate.IsBool),
+		"powerflex.snapshot_copy": validate.Optional(validate.IsBool),
 		// lxdmeta:generate(entities=storage-powerflex; group=pool-conf; key=volume.size)
 		// The size must be in multiples of 8 GiB.
 		// See {ref}`storage-powerflex-limitations` for more information.
@@ -387,4 +391,10 @@ func (d *powerflex) MigrationTypes(contentType ContentType, refresh bool, copySn
 			Features: rsyncFeatures,
 		},
 	}
+}
+
+// roundVolumeBlockSizeBytes rounds the given size (in bytes) up to the next
+// multiple of 8 GiB, which is the minimum allocation unit on PowerFlex.
+func (d *powerflex) roundVolumeBlockSizeBytes(_ Volume, sizeBytes int64) int64 {
+	return roundAbove(powerFlexMinVolumeSizeBytes, sizeBytes)
 }

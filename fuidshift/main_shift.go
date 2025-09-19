@@ -44,20 +44,14 @@ func (c *cmdShift) command() *cobra.Command {
 }
 
 func (c *cmdShift) run(cmd *cobra.Command, args []string) error {
-	// Help and usage
-	if len(args) == 0 {
+	// Show help if mandatory arguments aren't provided.
+	if len(args) < 2 {
 		return cmd.Help()
 	}
 
 	// Quick checks.
 	if !c.flagTestMode && os.Geteuid() != 0 {
 		return errors.New("This tool must be run as root")
-	}
-
-	// Handle mandatory arguments
-	if len(args) < 2 {
-		_ = cmd.Help()
-		return errors.New("Missing required arguments")
 	}
 
 	directory := args[0]
@@ -74,7 +68,7 @@ func (c *cmdShift) run(cmd *cobra.Command, args []string) error {
 
 	// Reverse shifting
 	if c.flagReverse {
-		err := idmapSet.UidshiftFromContainer(directory, c.flagTestMode)
+		err := idmapSet.UidShiftFromContainer(directory, c.flagTestMode)
 		if err != nil {
 			return err
 		}
@@ -83,7 +77,7 @@ func (c *cmdShift) run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Normal shifting
-	err := idmapSet.UidshiftIntoContainer(directory, c.flagTestMode)
+	err := idmapSet.UidShiftIntoContainer(directory, c.flagTestMode)
 	if err != nil {
 		return err
 	}

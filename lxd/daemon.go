@@ -24,7 +24,6 @@ import (
 
 	dqliteClient "github.com/canonical/go-dqlite/v3/client"
 	"github.com/canonical/go-dqlite/v3/driver"
-	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	liblxc "github.com/lxc/go-lxc"
 	"golang.org/x/sys/unix"
@@ -38,6 +37,7 @@ import (
 	"github.com/canonical/lxd/lxd/bgp"
 	"github.com/canonical/lxd/lxd/cluster"
 	clusterConfig "github.com/canonical/lxd/lxd/cluster/config"
+	"github.com/canonical/lxd/lxd/config"
 	"github.com/canonical/lxd/lxd/daemon"
 	"github.com/canonical/lxd/lxd/db"
 	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
@@ -61,11 +61,9 @@ import (
 	networkZone "github.com/canonical/lxd/lxd/network/zone"
 	"github.com/canonical/lxd/lxd/node"
 	"github.com/canonical/lxd/lxd/operations"
-	"github.com/canonical/lxd/lxd/project"
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/rsync"
-	scriptletLoad "github.com/canonical/lxd/lxd/scriptlet/load"
 	"github.com/canonical/lxd/lxd/seccomp"
 	"github.com/canonical/lxd/lxd/state"
 	storageDrivers "github.com/canonical/lxd/lxd/storage/drivers"
@@ -84,6 +82,9 @@ import (
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/version"
 )
+
+// secFetchSiteForbidden defines client Sec-Fetch-Site header values that will be forbidden access.
+var secFetchSiteForbidden = []string{"cross-site", "same-site"}
 
 // A Daemon can respond to requests from a shared client.
 type Daemon struct {
@@ -158,9 +159,6 @@ type Daemon struct {
 	serverName      string
 	serverClustered bool
 
-	// Server's UUID from file.
-	serverUUID string
-
 	lokiClient *loki.Client
 
 	// HTTP-01 challenge provider for ACME
@@ -174,6 +172,10 @@ type Daemon struct {
 
 	// Ubuntu Pro settings
 	ubuntuPro *ubuntupro.Client
+
+	// internalSecrets holds the current in-memory value of the secrets
+	internalSecrets   dbCluster.AuthSecrets
+	internalSecretsMu sync.Mutex
 }
 
 // DaemonConfig holds configuration values for Daemon.
@@ -186,15 +188,11 @@ type DaemonConfig struct {
 
 // newDaemon returns a new Daemon object with the given configuration.
 func newDaemon(config *DaemonConfig, os *sys.OS) *Daemon {
-	lxdEvents := events.NewServer(daemon.Debug, daemon.Verbose, cluster.EventHubPush)
-	devLXDEvents := events.NewDevLXDServer(daemon.Debug, daemon.Verbose)
 	shutdownCtx := cancel.New()
 
 	d := &Daemon{
 		identityCache:    &identity.Cache{},
 		config:           config,
-		devLXDEvents:     devLXDEvents,
-		events:           lxdEvents,
 		tasks:            task.NewGroup(),
 		clusterTasks:     task.NewGroup(),
 		db:               &db.DB{},
@@ -253,12 +251,18 @@ type APIEndpointAction struct {
 	Handler        func(d *Daemon, r *http.Request) response.Response
 	AccessHandler  func(d *Daemon, r *http.Request) response.Response
 	AllowUntrusted bool
+	ContentTypes   []string // Client content types to allow.
 }
 
 // allowAuthenticated is an AccessHandler which allows only authenticated requests. This should be used in conjunction
 // with further access control within the handler (e.g. to filter resources the user is able to view/edit).
 func allowAuthenticated(_ *Daemon, r *http.Request) response.Response {
-	if auth.IsTrusted(r.Context()) {
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if requestor.IsTrusted() {
 		return response.EmptySyncResponse
 	}
 
@@ -314,47 +318,54 @@ func allowPermission(entityType entity.Type, entitlement auth.Entitlement, muxVa
 // allowProjectResourceList should be used instead of allowAuthenticated when listing resources within a project.
 // This prevents a restricted TLS client from listing resources in a project that they do not have access to.
 func allowProjectResourceList(d *Daemon, r *http.Request) response.Response {
-	// The caller must be authenticated.
-	if !auth.IsTrusted(r.Context()) {
-		return response.Forbidden(nil)
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
 	}
 
-	isServerAdmin, err := auth.IsServerAdmin(r.Context(), d.identityCache)
-	if err != nil {
-		return response.InternalError(fmt.Errorf("Failed to determine caller privilege: %w", err))
+	// The caller must be authenticated.
+	if !requestor.IsTrusted() {
+		return response.Forbidden(nil)
 	}
 
 	// A root user can list resources in any project.
-	if isServerAdmin {
+	if requestor.IsAdmin() {
 		return response.EmptySyncResponse
 	}
 
-	id, err := auth.GetIdentityFromCtx(r.Context(), d.identityCache)
+	id := requestor.CallerIdentity()
+	if id == nil {
+		return response.InternalError(errors.New("No identity present in request details"))
+	}
+
+	idType := requestor.CallerIdentityType()
+	if idType == nil {
+		return response.InternalError(errors.New("No identity type present in request details"))
+	}
+
+	if idType.IsFineGrained() {
+		// Fine-grained clients can call the endpoint but may see an empty list.
+		return response.EmptySyncResponse
+	}
+
+	// We should now only be left with restricted client certificates. Metrics certificates should have been disregarded
+	// already, because they cannot call any endpoint other than /1.0/metrics (which is enforced during authentication).
+	if idType.Name() != api.IdentityTypeCertificateClientRestricted {
+		return response.InternalError(fmt.Errorf("Encountered unexpected identity type %q listing resources", idType.Name()))
+	}
+
+	requestProjectName, allProjects, err := request.ProjectParams(r)
 	if err != nil {
-		return response.InternalError(fmt.Errorf("Failed to determine caller identity: %w", err))
-	}
-
-	switch id.IdentityType {
-	case api.IdentityTypeOIDCClient:
-		// OIDC authenticated clients are governed by fine-grained auth. They can call the endpoint but may see an empty list.
-		return response.EmptySyncResponse
-	case api.IdentityTypeCertificateClient:
-		// Fine-grained TLS identities can list resources in any project. They may see an empty list.
-		return response.EmptySyncResponse
-	case api.IdentityTypeCertificateClientRestricted:
-		// A restricted client may be able to call the endpoint, continue.
-	default:
-		// No other identity types may list resources (e.g. metrics certificates).
-		return response.Forbidden(nil)
+		return response.SmartError(err)
 	}
 
 	// all-projects requests are not allowed
-	if shared.IsTrue(request.QueryParam(r, "all-projects")) {
+	if allProjects {
 		return response.Forbidden(errors.New("Certificate is restricted"))
 	}
 
 	// Disallow listing resources in projects the caller does not have access to.
-	if !slices.Contains(id.Projects, request.ProjectParam(r)) {
+	if !slices.Contains(id.Projects, requestProjectName) {
 		return response.Forbidden(errors.New("Certificate is restricted"))
 	}
 
@@ -363,19 +374,31 @@ func allowProjectResourceList(d *Daemon, r *http.Request) response.Response {
 
 // reportEntitlements takes a map of entity URLs to EntitlementReporters (in practice, API types that implement the ReportEntitlements method), and
 // reports the entitlements that the caller has on each entity URL to the corresponding EntitlementReporter.
-func reportEntitlements(ctx context.Context, authorizer auth.Authorizer, identityCache *identity.Cache, entityType entity.Type, requestedEntitlements []auth.Entitlement, entityURLToEntitlementReporter map[*api.URL]auth.EntitlementReporter) error {
+func reportEntitlements(ctx context.Context, authorizer auth.Authorizer, entityType entity.Type, requestedEntitlements []auth.Entitlement, entityURLToEntitlementReporter map[*api.URL]auth.EntitlementReporter) error {
 	// Nothing to do
 	if len(entityURLToEntitlementReporter) == 0 {
 		return nil
 	}
 
-	id, err := auth.GetIdentityFromCtx(ctx, identityCache)
+	requestor, err := request.GetRequestor(ctx)
 	if err != nil {
-		return fmt.Errorf("Failed to get caller identity: %w", err)
+		return err
 	}
 
-	if !identity.IsFineGrainedIdentityType(id.IdentityType) {
-		return errors.New("Not fine grained")
+	// No fine-grained identities are global admins. Check this first in case the caller is using e.g. the unix socket.
+	if requestor.IsAdmin() {
+		return api.NewStatusError(http.StatusBadRequest, "Cannot report entitlements for identities that do not use fine-grained authorization")
+	}
+
+	// Any other requestor should have an identity type present.
+	identityType := requestor.CallerIdentityType()
+	if identityType == nil {
+		return errors.New("No identity type present in request details")
+	}
+
+	// Check the identity type is fine-grained (it could be a restricted client certificate).
+	if !identityType.IsFineGrained() {
+		return api.NewStatusError(http.StatusBadRequest, "Cannot report entitlements for identities that do not use fine-grained authorization")
 	}
 
 	// In the case where we have only one entity URL, we'll use the authorizer's CheckPermission method
@@ -461,59 +484,66 @@ func extractEntitlementsFromQuery(r *http.Request, entityType entity.Type, allow
 // This does not perform authorization, only validates authentication.
 // Returns whether trusted or not, the username (or certificate fingerprint) of the trusted client, and the type of
 // client that has been authenticated (cluster, unix, oidc or tls).
-func (d *Daemon) Authenticate(w http.ResponseWriter, r *http.Request) (trusted bool, username string, method string, identityProviderGroups []string, err error) {
+func (d *Daemon) Authenticate(w http.ResponseWriter, r *http.Request) (*request.RequestorArgs, error) {
 	// Perform mTLS check against server certificates. If this passes, the request was made by another cluster member
-	// and the protocol is auth.AuthenticationMethodCluster.
+	// and the protocol is [request.ProtocolCluster].
 	if r.TLS != nil {
 		for _, i := range r.TLS.PeerCertificates {
 			trusted, fingerprint := util.CheckMutualTLS(*i, d.identityCache.X509Certificates(api.IdentityTypeCertificateServer))
 			if trusted {
-				return true, fingerprint, auth.AuthenticationMethodCluster, nil, nil
+				return &request.RequestorArgs{
+					Trusted:  true,
+					Username: fingerprint,
+					Protocol: request.ProtocolCluster,
+				}, nil
 			}
 		}
 	}
 
 	// Local unix socket queries.
 	if r.RemoteAddr == "@" && r.TLS == nil {
-		if w != nil {
-			cred, err := ucred.GetCredFromContext(r.Context())
-			if err != nil {
-				return false, "", "", nil, err
-			}
-
-			u, err := user.LookupId(strconv.FormatUint(uint64(cred.Uid), 10))
-			if err != nil {
-				return true, fmt.Sprint("uid=", cred.Uid), auth.AuthenticationMethodUnix, nil, nil
-			}
-
-			return true, u.Username, auth.AuthenticationMethodUnix, nil, nil
+		cred, err := ucred.GetCredFromContext(r.Context())
+		if err != nil {
+			return nil, err
 		}
 
-		return true, "", auth.AuthenticationMethodUnix, nil, nil
-	}
+		uid := strconv.FormatUint(uint64(cred.Uid), 10)
+		username := "uid=" + uid
 
-	// Cluster notification with wrong certificate.
-	if isClusterNotification(r) {
-		return false, "", "", nil, errors.New("Cluster notification isn't using trusted server certificate")
+		u, err := user.LookupId(uid)
+		if err == nil {
+			username = u.Username
+		}
+
+		return &request.RequestorArgs{
+			Trusted:  true,
+			Username: username,
+			Protocol: request.ProtocolUnix,
+		}, nil
 	}
 
 	// Bad query, no TLS found.
 	if r.TLS == nil {
-		return false, "", "", nil, errors.New("Bad/missing TLS on network query")
+		return nil, errors.New("Bad/missing TLS on network query")
 	}
 
 	if d.oidcVerifier != nil && d.oidcVerifier.IsRequest(r) {
-		result, err := d.oidcVerifier.Auth(d.shutdownCtx, w, r)
+		result, err := d.oidcVerifier.Auth(w, r)
 		if err != nil {
-			return false, "", "", nil, fmt.Errorf("Failed OIDC Authentication: %w", err)
+			return nil, fmt.Errorf("Failed OIDC Authentication: %w", err)
 		}
 
 		err = d.handleOIDCAuthenticationResult(r, result)
 		if err != nil {
-			return false, "", "", nil, fmt.Errorf("Failed to process OIDC authentication result: %w", err)
+			return nil, fmt.Errorf("Failed to process OIDC authentication result: %w", err)
 		}
 
-		return true, result.Email, api.AuthenticationMethodOIDC, result.IdentityProviderGroups, nil
+		return &request.RequestorArgs{
+			Trusted:                true,
+			Username:               result.Email,
+			Protocol:               api.AuthenticationMethodOIDC,
+			IdentityProviderGroups: result.IdentityProviderGroups,
+		}, nil
 	}
 
 	isMetricsRequest := func(u url.URL) bool {
@@ -537,26 +567,35 @@ func (d *Daemon) Authenticate(w http.ResponseWriter, r *http.Request) (trusted b
 		for _, peerCertificate := range r.TLS.PeerCertificates {
 			trusted, _, fingerprint := util.CheckCASignature(*peerCertificate, d.endpoints.NetworkCert())
 			if !trusted {
-				return false, "", "", nil, nil
-			} else if trustCACertificates {
-				// If CA signed certificates are implicitly trusted via `core.trust_ca_certificates`, return now. Otherwise, continue to mTLS check.
-				// Returning the protocol as auth.AuthenticationMethodPKI will indicate to the auth.Authorizer that
-				// this certificate may not be present in the trust store. If it isn't in the trust store, the caller
-				// has full access to LXD. If it is in the trust store, standard TLS restrictions will apply.
-				return true, fingerprint, auth.AuthenticationMethodPKI, nil, nil
+				return &request.RequestorArgs{Trusted: false}, nil
 			}
 
-			// We are trusted by the CA. But because `core.trust_ca_certificates` is false, we also need to check that
-			// the client certificate is in the trust store.
+			// Check if a matching certificate is present in the identity cache.
 			id, err := d.identityCache.Get(api.AuthenticationMethodTLS, fingerprint)
 			if err != nil {
-				return false, "", "", nil, nil
+				if !api.StatusErrorCheck(err, http.StatusNotFound) {
+					return nil, err
+				}
+
+				// If we have a not found error and `core.trust_ca_certificates` is true, then the identity is implicitly
+				// trusted because their certificate was signed by the CA.
+				if trustCACertificates {
+					return &request.RequestorArgs{
+						Trusted:  true,
+						Username: fingerprint,
+						Protocol: request.ProtocolPKI,
+					}, nil
+				}
+
+				// If we don't implicitly trust CA signed certificates, then the identity is not trusted because they
+				// are not present in the identity cache.
+				return &request.RequestorArgs{Trusted: false}, nil
 			}
 
 			// The identity type must be in our list of candidate types (e.g. if this certificate is a metrics certificate
 			// and we're on a non-metrics related route).
 			if !slices.Contains(candidateIdentityTypes, id.IdentityType) {
-				return false, "", "", nil, nil
+				return &request.RequestorArgs{Trusted: false}, nil
 			}
 
 			// In CA mode we only consider if this exact certificate is valid via mTLS checks below.
@@ -571,12 +610,16 @@ func (d *Daemon) Authenticate(w http.ResponseWriter, r *http.Request) (trusted b
 	for _, i := range r.TLS.PeerCertificates {
 		trusted, fingerprint := util.CheckMutualTLS(*i, candidateCertificates)
 		if trusted {
-			return true, fingerprint, api.AuthenticationMethodTLS, nil, nil
+			return &request.RequestorArgs{
+				Trusted:  true,
+				Username: fingerprint,
+				Protocol: api.AuthenticationMethodTLS,
+			}, nil
 		}
 	}
 
 	// Reject unauthorized.
-	return false, "", "", nil, nil
+	return &request.RequestorArgs{Trusted: false}, nil
 }
 
 // handleOIDCAuthenticationResult checks the identity cache for the OIDC identity by their email address. If no identity
@@ -653,12 +696,68 @@ func (d *Daemon) handleOIDCAuthenticationResult(r *http.Request, result *oidc.Au
 		}
 
 		lc := action.Event(api.AuthenticationMethodOIDC, result.Email, request.CreateRequestor(r.Context()), nil)
-		s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+		s.Events.SendLifecycle("", lc)
 
 		s.UpdateIdentityCache()
 	}
 
 	return nil
+}
+
+// getCoreAuthSecrets gets a copy of the current, cluster-wide secrets. The approach can be summarized as follows:
+// 1. Check if the current in-memory value is valid. If valid, return a copy.
+// 2. Check if the current in-database value is valid. If valid, replace in-memory value and return a copy.
+// 3. Rotate the in-database value within the transaction, then replace in-memory value and return a copy.
+// Steps 2 and 3 must happen within the same transaction so that database locking enforces consistency across the
+// cluster. Everything is performed with a lock on the in-memory value. Note that this approach assumes that the UTC
+// time is synchronized across all cluster members, as this is used for validity checking.
+func (d *Daemon) getCoreAuthSecrets(ctx context.Context) (dbCluster.AuthSecrets, error) {
+	// Obtain a lock.
+	d.internalSecretsMu.Lock()
+	defer d.internalSecretsMu.Unlock()
+
+	// Get the expiry.
+	expiry := d.globalConfig.AuthSecretExpiry()
+
+	// Check if the current in-memory secrets are valid.
+	err := d.internalSecrets.Validate(expiry)
+	if err == nil {
+		// If valid, return a copy.
+		return slices.Clone(d.internalSecrets), nil
+	}
+
+	// Otherwise, start a transaction.
+	err = d.db.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		// Get the secrets.
+		secrets, err := dbCluster.GetCoreAuthSecrets(ctx, tx.Tx())
+		if err != nil {
+			return err
+		}
+
+		// Check if the secrets are valid (if no secrets were found, then they are not valid).
+		err = secrets.Validate(expiry)
+		if err == nil {
+			// If valid, set internal secrets to the value defined in the database and exit transaction.
+			d.internalSecrets = secrets
+			return nil
+		}
+
+		// Rotate the secrets. If there were none, this will add the first value.
+		rotatedSecrets, err := secrets.Rotate(ctx, tx.Tx())
+		if err != nil {
+			return err
+		}
+
+		// Set internal secrets to the new value and exit transaction.
+		d.internalSecrets = rotatedSecrets
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Above transaction set the internal secrets to a new valid value. Return a copy.
+	return slices.Clone(d.internalSecrets), nil
 }
 
 // State creates a new State instance linked to our internal db and os.
@@ -700,12 +799,12 @@ func (d *Daemon) State() *state.State {
 		LocalConfig:         localConfig,
 		ServerName:          d.serverName,
 		ServerClustered:     d.serverClustered,
-		ServerUUID:          d.serverUUID,
 		StartTime:           d.startTime,
 		Authorizer:          d.authorizer,
 		UbuntuPro:           d.ubuntuPro,
 		NetworkReady:        d.waitNetworkReady,
 		StorageReady:        d.waitStorageReady,
+		CoreAuthSecrets:     d.getCoreAuthSecrets,
 	}
 
 	s.LeaderInfo = func() (*state.LeaderInfo, error) {
@@ -730,23 +829,12 @@ func (d *Daemon) State() *state.State {
 		}, nil
 	}
 
-	storagePath := func(config string, target string) string {
-		if config == "" {
-			return shared.VarPath(target)
-		}
-
-		poolName, volumeName, _ := daemonStorageSplitVolume(config)
-		volStorageName := project.StorageVolume(api.ProjectDefaultName, volumeName)
-		volMountPath := storageDrivers.GetVolumeMountPath(poolName, storageDrivers.VolumeTypeCustom, volStorageName)
-		return filepath.Join(volMountPath, target)
+	s.ImagesStoragePath = func(projectName string) string {
+		return daemonStoragePath(s.LocalConfig.StorageImagesVolume(projectName), config.DaemonStorageTypeImages)
 	}
 
-	s.ImagesStoragePath = func() string {
-		return storagePath(s.LocalConfig.StorageImagesVolume(), "images")
-	}
-
-	s.BackupsStoragePath = func() string {
-		return storagePath(s.LocalConfig.StorageBackupsVolume(), "backups")
+	s.BackupsStoragePath = func(projectName string) string {
+		return daemonStoragePath(s.LocalConfig.StorageBackupsVolume(projectName), config.DaemonStorageTypeBackups)
 	}
 
 	return s
@@ -789,7 +877,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 		}
 
 		// Authentication
-		trusted, username, protocol, identityProviderGroups, err := d.Authenticate(w, r)
+		requestor, err := d.Authenticate(w, r)
 		if err != nil {
 			var authError oidc.AuthError
 			if errors.As(err, &authError) {
@@ -808,61 +896,33 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 			return
 		}
 
-		// Ensure request context info is set.
-		reqInfo := request.SetupContextInfo(r)
-
-		// Set the "trusted" value in the request context.
-		reqInfo.Trusted = trusted
-
-		// Set request source address value in the request context.
-		reqInfo.SourceAddress = r.RemoteAddr
+		// Initialise the request info.
+		err = request.SetRequestor(r, d.identityCache, *requestor)
+		if err != nil {
+			_ = response.SmartError(err).Render(w, r)
+			return
+		}
 
 		// Reject internal queries to remote, non-cluster, clients
-		if version == "internal" && !slices.Contains([]string{auth.AuthenticationMethodUnix, auth.AuthenticationMethodCluster}, protocol) {
+		if version == "internal" && !slices.Contains([]string{request.ProtocolUnix, request.ProtocolCluster}, requestor.Protocol) {
 			// Except for the initial cluster accept request (done over trusted TLS)
-			if !trusted || c.Path != "cluster/accept" || protocol != api.AuthenticationMethodTLS {
+			if !requestor.Trusted || c.Path != "cluster/accept" || requestor.Protocol != api.AuthenticationMethodTLS {
 				logger.Warn("Rejecting remote internal API request", logger.Ctx{"ip": r.RemoteAddr})
 				_ = response.Forbidden(nil).Render(w, r)
 				return
 			}
 		}
 
-		logCtx := logger.Ctx{"method": r.Method, "url": r.URL.RequestURI(), "ip": r.RemoteAddr, "protocol": protocol}
-		if protocol == auth.AuthenticationMethodCluster {
-			logCtx["fingerprint"] = username
+		logCtx := logger.Ctx{"method": r.Method, "url": r.URL.RequestURI(), "ip": r.RemoteAddr, "protocol": requestor.Protocol}
+		if requestor.Protocol == request.ProtocolCluster {
+			logCtx["fingerprint"] = requestor.Username
 		} else {
-			logCtx["username"] = username
+			logCtx["username"] = requestor.Username
 		}
 
 		untrustedOk := (r.Method == "GET" && c.Get.AllowUntrusted) || (r.Method == "POST" && c.Post.AllowUntrusted)
-		if trusted {
+		if requestor.Trusted {
 			logger.Debug("Handling API request", logCtx)
-
-			// Add authentication/authorization context data.
-			reqInfo.Username = username
-			reqInfo.Protocol = protocol
-			if len(identityProviderGroups) > 0 {
-				reqInfo.IdentityProviderGroups = identityProviderGroups
-			}
-
-			// Add forwarded requestor data.
-			if protocol == auth.AuthenticationMethodCluster {
-				// Add authentication/authorization context data.
-				reqInfo.ForwardedAddress = r.Header.Get(request.HeaderForwardedAddress)
-				reqInfo.ForwardedUsername = r.Header.Get(request.HeaderForwardedUsername)
-				reqInfo.ForwardedProtocol = r.Header.Get(request.HeaderForwardedProtocol)
-
-				forwardedIdentityProviderGroupsJSON := r.Header.Get(request.HeaderForwardedIdentityProviderGroups)
-				if forwardedIdentityProviderGroupsJSON != "" {
-					var forwardedIdentityProviderGroups []string
-					err = json.Unmarshal([]byte(forwardedIdentityProviderGroupsJSON), &forwardedIdentityProviderGroups)
-					if err != nil {
-						logger.Error("Failed unmarshalling identity provider groups from forwarded request header", logger.Ctx{"err": err})
-					} else {
-						reqInfo.ForwardedIdentityProviderGroups = forwardedIdentityProviderGroups
-					}
-				}
-			}
 		} else if untrustedOk && r.Header.Get("X-LXD-authenticated") == "" {
 			logger.Debug("Allowing untrusted "+r.Method, logger.Ctx{"url": r.URL.RequestURI(), "ip": r.RemoteAddr})
 		} else {
@@ -929,13 +989,34 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 				return response.NotImplemented(nil)
 			}
 
+			// Protect against CSRF when using LXD-UI with browser that supports Fetch metadata.
+			// Deny Sec-Fetch-Site when set to cross-site or same-site.
+			if slices.Contains(secFetchSiteForbidden, r.Header.Get("Sec-Fetch-Site")) {
+				return response.ErrorResponse(http.StatusForbidden, "Forbidden Sec-Fetch-Site header value")
+			}
+
+			if len(action.ContentTypes) == 0 {
+				// Require application/json if not specified by handler.
+				action.ContentTypes = []string{"application/json"}
+			}
+
+			// Validate browser Content-Type if supplied, or if non-zero Content-Length supplied.
+			if isBrowserClient(r) {
+				contentTypeParts := shared.SplitNTrimSpace(r.Header.Get("Content-Type"), ";", 2, false) // Ignore multi-part boundary part.
+				contentLength := r.Header.Get("Content-Length")
+				hasContentLength := contentLength != "" && contentLength != "0"
+				if (hasContentLength || contentTypeParts[0] != "") && !slices.Contains(action.ContentTypes, contentTypeParts[0]) {
+					return response.ErrorResponse(http.StatusUnsupportedMediaType, "Unsupported Content-Type for this request")
+				}
+			}
+
 			// All APIEndpointActions should have an access handler or should allow untrusted requests.
 			if action.AccessHandler == nil && !action.AllowUntrusted {
 				return response.InternalError(fmt.Errorf("Access handler not defined for %s %s", r.Method, r.URL.RequestURI()))
 			}
 
 			// If the request is not trusted, only call the handler if the action allows it.
-			if !trusted && !action.AllowUntrusted {
+			if !requestor.Trusted && !action.AllowUntrusted {
 				return response.Forbidden(errors.New("You must be authenticated"))
 			}
 
@@ -1078,9 +1159,9 @@ func (d *Daemon) init() error {
 	d.startStopLock.Lock()
 	defer d.startStopLock.Unlock()
 
-	var err error
-
 	var dbWarnings []dbCluster.Warning
+
+	var err error
 
 	// Set default authorizer.
 	d.authorizer, err = authDrivers.LoadAuthorizer(d.shutdownCtx, authDrivers.DriverTLS, logger.Log, d.identityCache)
@@ -1088,7 +1169,14 @@ func (d *Daemon) init() error {
 		return err
 	}
 
-	// Setup logger
+	// Setup events
+	d.devLXDEvents = events.NewDevLXDServer(daemon.Debug, daemon.Verbose)
+	d.events, err = events.NewServer(daemon.Debug, daemon.Verbose, cluster.EventHubPush)
+	if err != nil {
+		return err
+	}
+
+	// Configure logging events.
 	events.LoggingServer = d.events
 
 	// Setup internal event listener
@@ -1168,7 +1256,7 @@ func (d *Daemon) init() error {
 	}
 
 	// Look for kernel features
-	logger.Infof("Kernel features:")
+	logger.Info("Kernel features:")
 
 	d.os.CloseRange = canUseCloseRange()
 	if d.os.CloseRange {
@@ -1269,10 +1357,10 @@ func (d *Daemon) init() error {
 	d.os.VFS3Fscaps = idmap.SupportsVFS3Fscaps("")
 	if d.os.VFS3Fscaps {
 		idmap.VFS3Fscaps = idmap.VFS3FscapsSupported
-		logger.Infof(" - unprivileged file capabilities: yes")
+		logger.Info(" - unprivileged file capabilities: yes")
 	} else {
 		idmap.VFS3Fscaps = idmap.VFS3FscapsUnsupported
-		logger.Infof(" - unprivileged file capabilities: no")
+		logger.Info(" - unprivileged file capabilities: no")
 	}
 
 	dbWarnings = append(dbWarnings, d.os.CGInfo.Warnings()...)
@@ -1435,7 +1523,7 @@ func (d *Daemon) init() error {
 	}
 
 	/* Setup the web server */
-	config := &endpoints.Config{
+	endpointsConfig := &endpoints.Config{
 		Dir:                  d.os.VarDir,
 		UnixSocket:           d.os.GetUnixSocket(),
 		Cert:                 networkCert,
@@ -1454,10 +1542,10 @@ func (d *Daemon) init() error {
 	// Enable vsock server support if VM instances supported.
 	err, found := d.State().InstanceTypes[instancetype.VM]
 	if found && err == nil {
-		config.VsockSupport = true
+		endpointsConfig.VsockSupport = true
 	}
 
-	d.endpoints, err = endpoints.Up(config)
+	d.endpoints, err = endpoints.Up(endpointsConfig)
 	if err != nil {
 		return err
 	}
@@ -1495,7 +1583,7 @@ func (d *Daemon) init() error {
 		// Assign cluster DB handle to d.gateway.Cluster so its immediately usable by gateway even if DB
 		// returns StatusPreconditionFailed. This way its usable for heartbeats whilst it waits for the
 		// other members to become aligned.
-		d.gateway.Cluster, err = db.OpenCluster(d.shutdownCtx, "db.bin", store, localClusterAddress, dir, d.config.DqliteSetupTimeout, nil, options...)
+		d.gateway.Cluster, err = db.OpenCluster(d.shutdownCtx, "db.bin", store, localClusterAddress, dir, d.config.DqliteSetupTimeout, nil, d.os.ServerUUID, options...)
 		if err == nil {
 			logger.Info("Initialized global database")
 
@@ -1526,7 +1614,10 @@ func (d *Daemon) init() error {
 
 			_ = hbGroup.Stop(time.Second)
 			_ = d.gateway.Cluster.Close()
+
+			d.gateway.HeartbeatLock.Lock()
 			d.gateway.Cluster = nil
+			d.gateway.HeartbeatLock.Unlock()
 
 			continue
 		}
@@ -1565,7 +1656,7 @@ func (d *Daemon) init() error {
 
 	// Load server name and config before patches run (so they can access them from d.State()).
 	err = d.db.Cluster.Transaction(d.shutdownCtx, func(ctx context.Context, tx *db.ClusterTx) error {
-		config, err := clusterConfig.Load(ctx, tx)
+		globalConfig, err := clusterConfig.Load(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -1578,8 +1669,19 @@ func (d *Daemon) init() error {
 
 		d.globalConfigMu.Lock()
 		d.serverName = serverName
-		d.globalConfig = config
+		d.globalConfig = globalConfig
 		d.globalConfigMu.Unlock()
+
+		// Add the per-project config options to the daemon config schema.
+		projects, err := dbCluster.GetProjectNames(ctx, tx.Tx())
+		if err != nil {
+			return fmt.Errorf("Failed to get project names: %w", err)
+		}
+
+		for _, project := range projects {
+			node.ConfigSchema["storage.project."+project+".images_volume"] = config.Key{}
+			node.ConfigSchema["storage.project."+project+".backups_volume"] = config.Key{}
+		}
 
 		return nil
 	})
@@ -1589,31 +1691,8 @@ func (d *Daemon) init() error {
 
 	d.events.SetLocalLocation(d.serverName)
 
-	// Setup and load the server's UUID file.
-	// Use os.VarDir to allow setting up the uuid file also in the test suite.
-	var serverUUID string
-	uuidPath := filepath.Join(d.os.VarDir, "server.uuid")
-	if !shared.PathExists(uuidPath) {
-		serverUUID = uuid.New().String()
-		err := os.WriteFile(uuidPath, []byte(serverUUID), 0600)
-		if err != nil {
-			return fmt.Errorf("Failed to create server.uuid file: %w", err)
-		}
-	}
-
-	if serverUUID == "" {
-		uuidBytes, err := os.ReadFile(uuidPath)
-		if err != nil {
-			return fmt.Errorf("Failed to read server.uuid file: %w", err)
-		}
-
-		serverUUID = string(uuidBytes)
-	}
-
-	d.serverUUID = serverUUID
-
 	// Mount the storage pools.
-	logger.Infof("Initializing storage pools")
+	logger.Info("Initializing storage pools")
 	err = storageStartup(d.State())
 	if err != nil {
 		return err
@@ -1626,7 +1705,7 @@ func (d *Daemon) init() error {
 	}
 
 	// Mount any daemon storage volumes.
-	logger.Infof("Initializing daemon storage mounts")
+	logger.Info("Initializing daemon storage mounts")
 	err = daemonStorageMount(d.State())
 	if err != nil {
 		return err
@@ -1689,7 +1768,6 @@ func (d *Daemon) init() error {
 	lokiURL, lokiUsername, lokiPassword, lokiCACert, lokiInstance, lokiLoglevel, lokiLabels, lokiTypes := d.globalConfig.LokiServer()
 	oidcIssuer, oidcClientID, oidcClientSecret, oidcScopes, oidcAudience, oidcGroupsClaim := d.globalConfig.OIDCServer()
 	syslogSocketEnabled := d.localConfig.SyslogSocket()
-	instancePlacementScriptlet := d.globalConfig.InstancesPlacementScriptlet()
 
 	d.endpoints.NetworkUpdateTrustedProxy(d.globalConfig.HTTPSTrustedProxy())
 	d.globalConfigMu.Unlock()
@@ -1715,7 +1793,7 @@ func (d *Daemon) init() error {
 			return util.HTTPClient("", d.proxy)
 		}
 
-		d.oidcVerifier, err = oidc.NewVerifier(oidcIssuer, oidcClientID, oidcClientSecret, oidcScopes, oidcAudience, d.serverCert, d.identityCache, httpClientFunc, &oidc.Opts{GroupsClaim: oidcGroupsClaim})
+		d.oidcVerifier, err = oidc.NewVerifier(oidcIssuer, oidcClientID, oidcClientSecret, oidcScopes, oidcAudience, d.getCoreAuthSecrets, d.identityCache, httpClientFunc, &oidc.Opts{GroupsClaim: oidcGroupsClaim})
 		if err != nil {
 			return err
 		}
@@ -1762,13 +1840,11 @@ func (d *Daemon) init() error {
 	})
 
 	// Setup the networks.
-	if !d.db.Cluster.LocalNodeIsEvacuated() {
-		logger.Infof("Initializing networks")
+	logger.Info("Initializing networks")
 
-		err = networkStartup(d.State)
-		if err != nil {
-			return err
-		}
+	err = networkStartup(d.State, false)
+	if err != nil {
+		return err
 	}
 
 	// Setup tertiary listeners that may use managed network addresses and must be started after networks.
@@ -1808,14 +1884,6 @@ func (d *Daemon) init() error {
 		err = d.endpoints.UpStorageBuckets(storageBucketsAddress)
 		if err != nil {
 			return err
-		}
-	}
-
-	// Load instance placement scriptlet.
-	if instancePlacementScriptlet != "" {
-		err = scriptletLoad.InstancePlacementSet(instancePlacementScriptlet)
-		if err != nil {
-			logger.Warn("Failed loading instance placement scriptlet", logger.Ctx{"err": err})
 		}
 	}
 
@@ -1859,7 +1927,13 @@ func (d *Daemon) init() error {
 		// Setup seccomp handler
 		if d.os.SeccompListener {
 			seccompServer, err := seccomp.NewSeccompServer(d.State(), shared.VarPath("seccomp.socket"), func(pid int32, state *state.State) (seccomp.Instance, error) {
-				return findContainerForPID(pid, state)
+				c, _, err := getLXCMonitorContainer(state, pid)
+				if err != nil || c == nil {
+					logger.Warn("Could not match PID to container for seccomp", logger.Ctx{"pid": pid, "err": err})
+					return nil, errPIDNotInContainer // Don't return error to avoid leaking details about the process.
+				}
+
+				return c, nil
 			})
 			if err != nil {
 				return err
@@ -2027,7 +2101,11 @@ func (d *Daemon) startClusterTasks() {
 }
 
 func (d *Daemon) stopClusterTasks() {
-	_ = d.clusterTasks.Stop(3 * time.Second)
+	err := d.clusterTasks.Stop(3 * time.Second)
+	if err != nil {
+		logger.Warn("Failed stopping cluster tasks", logger.Ctx{"err": err})
+	}
+
 	d.clusterTasks = task.NewGroup()
 }
 
@@ -2141,7 +2219,7 @@ func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
 			}
 
 			// Stop networks.
-			networkingStop(s)
+			networkStop(s, false)
 
 			// Unmount daemon image and backup volumes if set.
 			logger.Info("Stopping daemon storage volumes")

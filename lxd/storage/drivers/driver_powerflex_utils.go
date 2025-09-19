@@ -21,7 +21,6 @@ import (
 	"github.com/canonical/lxd/lxd/storage/connectors"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
-	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/revert"
 )
 
@@ -53,6 +52,10 @@ var powerFlexVolTypePrefixes = map[VolumeType]string{
 	VolumeTypeImage:     "i",
 	VolumeTypeCustom:    "u",
 }
+
+// powerFlexSnapshotPrefix is a prefix used ONLY for actual PowerFlex snapshots of a volume.
+// It is NOT used for snapshots made when copying a volume with powerflex.snapshot_copy=true.
+var powerFlexSnapshotPrefix = "s"
 
 // powerFlexError contains arbitrary error responses from PowerFlex.
 // The maps values can be of various types.
@@ -160,14 +163,6 @@ type powerFlexVolume struct {
 		NQN      string `json:"nqn"`
 		HostType string `json:"hostType"`
 	} `json:"mappedSdcInfo"`
-}
-
-type powerFlexDiscoveryLogRecord struct {
-	SubNQN string `json:"subnqn"`
-}
-
-type powerFlexDiscoveryLog struct {
-	Records []powerFlexDiscoveryLogRecord `json:"records"`
 }
 
 // powerFlexClient holds the PowerFlex HTTP client and an access token factory.
@@ -500,6 +495,20 @@ func (p *powerFlexClient) overwriteVolume(volumeID string, snapshotID string) er
 	return nil
 }
 
+// renameVolume renames the volume behind volumeID to newName.
+func (p *powerFlexClient) renameVolume(volumeID string, newName string) error {
+	body := map[string]any{
+		"newName": newName,
+	}
+
+	err := p.requestAuthenticated(http.MethodPost, "/api/instances/Volume::"+volumeID+"/action/setVolumeName", body, nil)
+	if err != nil {
+		return fmt.Errorf("Failed to rename volume: %q: %w", volumeID, err)
+	}
+
+	return nil
+}
+
 // createVolumeSnapshot creates a new volume snapshot under the given systemID for the volume behind volumeID.
 // The accessMode can be either ReadWrite or ReadOnly.
 // The returned string represents the ID of the snapshot.
@@ -766,14 +775,28 @@ func (d *powerflex) getHostGUID() (string, error) {
 // Cache the targetQN as it doesn't change throughout the lifetime of the storage pool.
 func (d *powerflex) getNVMeTargetQN(targetAddresses ...string) (string, error) {
 	if d.nvmeTargetQN == "" {
+		connector, err := d.connector()
+		if err != nil {
+			return "", err
+		}
+
 		// The discovery log from the first reachable target address is returned.
-		discoveryLogRecords, err := d.discover(d.state.ShutdownCtx, targetAddresses...)
+		discoveryLogRecords, err := connector.Discover(d.state.ShutdownCtx, targetAddresses...)
 		if err != nil {
 			return "", fmt.Errorf("Failed to discover SDT NQN: %w", err)
 		}
 
-		for _, record := range discoveryLogRecords {
-			// The targetQN is listed together with every log record.
+		for _, recordAny := range discoveryLogRecords {
+			record, ok := recordAny.(connectors.NVMeDiscoveryLogRecord)
+			if !ok {
+				return "", fmt.Errorf("Invalid discovery log record entry type %T is not connectors.NVMeDiscoveryLogRecord", recordAny)
+			}
+
+			if record.SubType != connectors.SubtypeNVMESubsys {
+				continue
+			}
+
+			// The targetQN is listed together with every log record of type SubtypeNVMESubsys.
 			d.nvmeTargetQN = record.SubNQN
 			break
 		}
@@ -917,7 +940,7 @@ func (d *powerflex) mapVolume(vol Volume) (revert.Hook, error) {
 
 	switch d.config["powerflex.mode"] {
 	case connectors.TypeNVME:
-		unlock, err := remoteVolumeMapLock(connector.Type(), "powerflex")
+		unlock, err := remoteVolumeMapLock(connector.Type(), d.Info().Name)
 		if err != nil {
 			return nil, err
 		}
@@ -1111,7 +1134,7 @@ func (d *powerflex) unmapVolume(vol Volume) error {
 			return err
 		}
 
-		unlock, err := remoteVolumeMapLock(connector.Type(), "powerflex")
+		unlock, err := remoteVolumeMapLock(connector.Type(), d.Info().Name)
 		if err != nil {
 			return err
 		}
@@ -1249,56 +1272,15 @@ func (d *powerflex) getVolumeName(vol Volume) (string, error) {
 		volumeTypePrefix = volumeTypePrefix + "_"
 	}
 
-	return volumeTypePrefix + volName + suffix, nil
-}
+	volName = volumeTypePrefix + volName + suffix
 
-// discover returns the SDTs (targets) found on the first reachable targetAddr.
-func (d *powerflex) discover(ctx context.Context, targetAddresses ...string) ([]powerFlexDiscoveryLogRecord, error) {
-	connector, err := d.connector()
-	if err != nil {
-		return nil, err
+	// If volume is snapshot, prepend snapshot prefix to its name.
+	// This allows differentiating between snapshots which actually belong to its parent volume
+	// and snapshots which were being created as part of copying a volume using powerflex.snapshot_copy.
+	// The latter are snapshots of the original volume stand on their own and don't use the snapshot prefix.
+	if vol.IsSnapshot() {
+		volName = powerFlexSnapshotPrefix + volName
 	}
 
-	hostNQN, err := connector.QualifiedName()
-	if err != nil {
-		return nil, err
-	}
-
-	// Set a deadline for the overall discovery.
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	var discoveryLog powerFlexDiscoveryLog
-	for _, targetAddr := range targetAddresses {
-		stdout, err := shared.RunCommandContext(ctx, "nvme", "discover", "--transport", "tcp", "--traddr", targetAddr, "--hostnqn", hostNQN, "--hostid", d.state.ServerUUID, "--output-format", "json")
-		if err != nil {
-			// Exit code 110 is returned if the target address cannot be reached.
-			logger.Warn("Failed connecting to discovery target", logger.Ctx{"target_address": targetAddr, "err": err})
-			continue
-		}
-
-		// In case no discovery log entries can be fetched the nvme command doesn't return JSON formatted text.
-		if strings.Trim(stdout, "\n") == "No discovery log entries to fetch." {
-			logger.Warn("Failed to find discovery log entries", logger.Ctx{"target_address": targetAddr, "err": err})
-			continue
-		}
-
-		// Try to unmarshal the returned log entries.
-		err = json.Unmarshal([]byte(stdout), &discoveryLog)
-		if err != nil {
-			// Don't just log this error.
-			// Something is clearly wrong with the returned output.
-			return nil, fmt.Errorf("Failed to unmarshal the returned discovery log entries from %q", targetAddr)
-		}
-
-		// Unmarshalling the response from the discovery succeeded, break the loop.
-		break
-	}
-
-	// In case none of the target addresses returned any log records also return an error.
-	if len(discoveryLog.Records) == 0 {
-		return nil, errors.New("Failed to fetch a discovery log record from any of the target addresses")
-	}
-
-	return discoveryLog.Records, nil
+	return volName, nil
 }

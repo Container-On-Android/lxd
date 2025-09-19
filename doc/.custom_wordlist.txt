@@ -52,7 +52,9 @@ CPUs
 CRIU
 CRL
 cron
+cryptographic
 cryptographically
+CSI
 CSM
 CSV
 CUDA
@@ -60,6 +62,7 @@ dataset
 dGPU
 DCO
 dereferenced
+DevLXD
 DHCP
 DHCPv
 Diffie
@@ -214,6 +217,7 @@ PNG
 Pongo
 POSIX
 PowerFlex
+preconfigured
 prepended
 preseed
 proxied
@@ -227,6 +231,7 @@ QMP
 qgroup
 qgroups
 RADOS
+radosgw
 RBAC
 RBD
 RDP
@@ -234,6 +239,7 @@ README
 reconfiguring
 requestor
 RESTful
+RGW
 RHEL
 rollout
 rootfs
@@ -344,9 +350,11 @@ virtualized
 VLAN
 VLANs
 VMs
+VM's
 VPD
 VPN
 VRAM
+Vsock
 vSwitch
 vTree
 VXLAN
@@ -359,3 +367,9 @@ Zettabyte
 ZFS
 zpool
 zpools
+HPE
+Alletra
+WSAPI
+CPG
+vLUN
+vLUNs

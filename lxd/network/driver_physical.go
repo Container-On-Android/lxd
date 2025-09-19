@@ -10,9 +10,9 @@ import (
 	"slices"
 	"strconv"
 
-	"github.com/canonical/lxd/lxd/cluster/request"
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/ip"
+	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/resources"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
@@ -411,10 +411,14 @@ func (n *physical) setup(oldConfig map[string]string) error {
 		}
 	}
 
+	nodeEvacuated := n.state.DB.Cluster.LocalNodeIsEvacuated()
+
 	// Setup BGP.
-	err = n.bgpSetup(oldConfig)
-	if err != nil {
-		return err
+	if !nodeEvacuated {
+		err = n.bgpSetup(oldConfig)
+		if err != nil {
+			return err
+		}
 	}
 
 	revert.Success()
@@ -461,6 +465,22 @@ func (n *physical) Stop() error {
 	}
 
 	return nil
+}
+
+// Evacuate the network by clearing BGP.
+func (n *physical) Evacuate() error {
+	n.logger.Debug("Evacuate")
+
+	// Clear BGP.
+	return n.bgpClear(n.config)
+}
+
+// Restore the network by setting up BGP.
+func (n *physical) Restore() error {
+	n.logger.Debug("Restore")
+
+	// Setup BGP.
+	return n.bgpSetup(nil)
 }
 
 // Update updates the network. Accepts notification boolean indicating if this update request is coming from a

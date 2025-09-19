@@ -6,14 +6,13 @@ test_waitready() {
   br_name="lxdt$$"
 
   lxc storage create "${storage_pool}" "${lxd_backend}"
-  lxc network create "${br_name}"
+  lxc network create "${br_name}" ipv4.address=none ipv6.address=none
 
   echo "==> Corrupt the network by setting an invalid external interface"
-  ip link add foo type bridge
+  ip link add foo type dummy
+  lxc network set "${br_name}" bridge.external_interfaces=foo
+  # Set the address after adding the interface to the bridge as LXD's validation would catch this.
   ip addr add dev foo 10.1.123.10/24
-  # Inject the config setting manually to prevent validation by LXD.
-  network_id="$(lxd sql global "select id from networks where name='${br_name}'" -f csv)"
-  lxd sql global "INSERT INTO networks_config (network_id, node_id, key, value) VALUES (${network_id}, null, 'bridge.external_interfaces', 'foo')"
 
   # Stop the daemon.
   shutdown_lxd "${LXD_DIR}"
@@ -32,7 +31,7 @@ test_waitready() {
   [ "$(lxd waitready --network --storage --timeout 1 2>&1)" = "Error: Networks not ready yet after 1s timeout" ]
 
   # Not setting a timeout should have the same effect and return instantly.
-  [ "$(DEBUG="" lxc query "/internal/ready?network=1&storage=1" 2>&1)" = "Error: Networks not ready yet" ]
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" lxc query "/internal/ready?network=1&storage=1" 2>&1)" = "Error: Networks not ready yet" ]
 
   # The standard waitready without extra flags should still return with success.
   lxd waitready
@@ -42,7 +41,7 @@ test_waitready() {
   lxc storage show "${storage_pool}" | grep -xF "status: Unavailable"
 
   echo "==> Restore the network by unsetting the external interface"
-  lxd sql global 'DELETE FROM networks_config WHERE key="bridge.external_interfaces"'
+  lxc network unset "${br_name}" bridge.external_interfaces
   ip link del foo
 
   # LXD retries starting the networks every 60s.
@@ -51,7 +50,7 @@ test_waitready() {
   [ "$(lxd waitready --network --storage --timeout 80 2>&1)" = "Error: Storage pools not ready yet after 80s timeout" ]
 
   # Not setting a timeout should have the same effect and return instantly.
-  [ "$(DEBUG="" lxc query "/internal/ready?network=1&storage=1" 2>&1)" = "Error: Storage pools not ready yet" ]
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" lxc query "/internal/ready?network=1&storage=1" 2>&1)" = "Error: Storage pools not ready yet" ]
 
   # The standard waitready without extra flags should still return with success.
   lxd waitready

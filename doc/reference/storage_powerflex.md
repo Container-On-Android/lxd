@@ -62,9 +62,10 @@ To be able to identify the volume types and snapshots, special identifiers are p
 Type            | Identifier   | Example
 :--             | :---         | :----------
 Container       | `c_`         | `c_WiUEsGpsSEmO592wtnT9FA==`
-Virtual machine | `v_`         | `v_WiUEsGpsSEmO592wtnT9FA==.b`
+Virtual machine | `v_`         | `v_WiUEsGpsSEmO592wtnT9FA==.b` (block volume) and `v_WiUEsGpsSEmO592wtnT9FA==` (file system volume)
 Image (ISO)     | `i_`         | `i_WiUEsGpsSEmO592wtnT9FA==.i`
-Custom volume   | `u_`         | `u_WiUEsGpsSEmO592wtnT9FA==`
+Custom volume   | `u_`         | `u_WiUEsGpsSEmO592wtnT9FA==` (file system volume) and `u_WiUEsGpsSEmO592wtnT9FA==.b` (block volume)
+Snapshot        | `s`          | `sc_WiUEsGpsSEmO592wtnT9FA==` (container snapshot), `sv_WiUEsGpsSEmO592wtnT9FA==.b` (VM snapshot) and `su_WiUEsGpsSEmO592wtnT9FA==` (custom volume snapshot)
 
 (storage-powerflex-limitations)=
 ### Limitations
@@ -101,6 +102,10 @@ Sharing the PowerFlex storage pool between installations
 
 Recovering PowerFlex storage pools
 : Recovery of PowerFlex storage pools using `lxd recover` is not supported.
+
+Incompatible instance images
+: The Ubuntu Noble Numbat image cannot be used together with the {config:option}`storage-powerflex-pool-conf:powerflex.mode` set to `sdc`.
+  This is due to a limitation of SDC not being able to manage volumes with more than 15 partitions.
 
 ## Configuration options
 

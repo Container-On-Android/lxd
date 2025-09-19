@@ -165,8 +165,9 @@ var internalIdentityCacheRefreshCmd = APIEndpoint{
 }
 
 type internalImageOptimizePost struct {
-	Image api.Image `json:"image" yaml:"image"`
-	Pool  string    `json:"pool"  yaml:"pool"`
+	Image   api.Image `json:"image"    yaml:"image"`
+	Pool    string    `json:"pool"     yaml:"pool"`
+	Project string    `json:"project"  yaml:"project"`
 }
 
 type internalWarningCreatePost struct {
@@ -215,7 +216,7 @@ func internalOptimizeImage(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	err = imageCreateInPool(s, &req.Image, req.Pool)
+	err = imageCreateInPool(s, &req.Image, req.Pool, req.Project)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -1047,8 +1048,8 @@ func internalImportFromBackup(ctx context.Context, s *state.State, projectName s
 // device will be added, if the root disk config in the current profiles matches the effective backup.yaml config.
 func internalImportRootDevicePopulate(instancePoolName string, localDevices map[string]map[string]string, expandedDevices map[string]map[string]string, profiles []api.Profile) {
 	// First, check if localDevices from backup.yaml has a root disk.
-	rootName, _, _ := instancetype.GetRootDiskDevice(localDevices)
-	if rootName != "" {
+	rootName, _, err := instancetype.GetRootDiskDevice(localDevices)
+	if err == nil && rootName != "" {
 		localDevices[rootName]["pool"] = instancePoolName
 
 		return // Local root disk device has been set to target pool.
@@ -1136,7 +1137,7 @@ func internalImportRootDevicePopulate(instancePoolName string, localDevices map[
 }
 
 func internalGC(_ *Daemon, _ *http.Request) response.Response {
-	logger.Infof("Started forced garbage collection run")
+	logger.Info("Started forced garbage collection run")
 	runtime.GC()
 	runtimeDebug.FreeOSMemory()
 
@@ -1147,7 +1148,7 @@ func internalGC(_ *Daemon, _ *http.Request) response.Response {
 	logger.Infof("Requested from system: %s", units.GetByteSizeStringIEC(int64(m.Sys), 2))
 	logger.Infof("Releasable to OS: %s", units.GetByteSizeStringIEC(int64(m.HeapIdle-m.HeapReleased), 2))
 
-	logger.Infof("Completed forced garbage collection run")
+	logger.Info("Completed forced garbage collection run")
 
 	return response.EmptySyncResponse
 }

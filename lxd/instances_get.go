@@ -247,20 +247,15 @@ func instancesGet(d *Daemon, r *http.Request) response.Response {
 
 	mustLoadObjects := recursion > 0 || (recursion == 0 && clauses != nil && len(clauses.Clauses) > 0)
 
-	// Detect project mode.
-	projectName := request.QueryParam(r, "project")
-	allProjects := shared.IsTrue(r.FormValue("all-projects"))
+	projectName, allProjects, err := request.ProjectParams(r)
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	// Detect if we want to also return entitlements for each instance.
 	withEntitlements, err := extractEntitlementsFromQuery(r, entity.TypeInstance, true)
 	if err != nil {
 		return response.SmartError(err)
-	}
-
-	if allProjects && projectName != "" {
-		return response.BadRequest(errors.New("Cannot specify a project when requesting all projects"))
-	} else if !allProjects && projectName == "" {
-		projectName = api.ProjectDefaultName
 	}
 
 	// Get the list and location of all instances.
@@ -341,13 +336,20 @@ func instancesGet(d *Daemon, r *http.Request) response.Response {
 		}
 	}
 
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	isClusterNotification := requestor.IsClusterNotification()
+
 	// Get the data
 	wg := sync.WaitGroup{}
 	networkCert := s.Endpoints.NetworkCert()
 	for memberAddress, instances := range memberAddressInstances {
 		// If this is an internal request from another cluster node, ignore instances from other
 		// projectInstanceToNodeName, and return only the ones on this member.
-		if isClusterNotification(r) && memberAddress != "" {
+		if isClusterNotification && memberAddress != "" {
 			continue
 		}
 
@@ -362,7 +364,7 @@ func instancesGet(d *Daemon, r *http.Request) response.Response {
 
 		// For recursion requests we need to fetch the state of remote instances from their respective
 		// projectInstanceToNodeName.
-		if mustLoadObjects && memberAddress != "" && !isClusterNotification(r) {
+		if mustLoadObjects && memberAddress != "" && !isClusterNotification {
 			wg.Add(1)
 
 			go func(memberAddress string, instances []db.Instance) {
@@ -379,7 +381,6 @@ func instancesGet(d *Daemon, r *http.Request) response.Response {
 					}
 
 					for _, apiInst := range apiInsts {
-						apiInst := apiInst // Local variable for append.
 						resultFullListAppend(&api.InstanceFull{Instance: apiInst})
 					}
 
@@ -396,7 +397,6 @@ func instancesGet(d *Daemon, r *http.Request) response.Response {
 				}
 
 				for _, c := range cs {
-					c := c // Local variable for append.
 					resultFullListAppend(&c)
 				}
 			}(memberAddress, instances)
@@ -522,7 +522,7 @@ func instancesGet(d *Daemon, r *http.Request) response.Response {
 			urlToInstance[u] = res
 		}
 
-		err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeInstance, withEntitlements, urlToInstance)
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeInstance, withEntitlements, urlToInstance)
 		if err != nil {
 			return response.SmartError(err)
 		}

@@ -1,6 +1,5 @@
 test_container_devices_nic_bridged_vlan() {
   ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
   prefix="lxdvlan$$"
   bridgeDriver=${LXD_NIC_BRIDGED_DRIVER:-"native"}
 
@@ -14,12 +13,12 @@ test_container_devices_nic_bridged_vlan() {
   lxc network set "${prefix}" bridge.driver "${bridgeDriver}"
 
   if [ "$bridgeDriver" = "native" ]; then
-    if ! grep "1" "/sys/class/net/${prefix}/bridge/vlan_filtering"; then
+    if [ "$(< "/sys/class/net/${prefix}/bridge/vlan_filtering")" != "1" ]; then
       echo "vlan filtering not enabled on managed bridge interface"
       false
     fi
 
-    if ! grep "1" "/sys/class/net/${prefix}/bridge/default_pvid"; then
+    if [ "$(< "/sys/class/net/${prefix}/bridge/default_pvid")" != "1" ]; then
       echo "vlan default PVID not 1 on managed bridge interface"
       false
     fi
@@ -40,8 +39,8 @@ test_container_devices_nic_bridged_vlan() {
   lxc exec "${prefix}-ctB" -- ip link add link eth0 name eth0.2 type vlan id 2
   lxc exec "${prefix}-ctB" -- ip link set eth0.2 up
   lxc exec "${prefix}-ctB" -- ip a add 192.0.2.2/24 dev eth0.2
-  lxc exec "${prefix}-ctA" -- ping -c2 -W5 192.0.2.2
-  lxc exec "${prefix}-ctB" -- ping -c2 -W5 192.0.2.1
+  lxc exec "${prefix}-ctA" -- ping -nc2 -i0.1 -W1 192.0.2.2
+  lxc exec "${prefix}-ctB" -- ping -nc2 -i0.1 -W1 192.0.2.1
   lxc stop -f "${prefix}-ctA"
 
   # Test tagged VLAN traffic is filtered when IP filtering is enabled.
@@ -51,8 +50,8 @@ test_container_devices_nic_bridged_vlan() {
     lxc exec "${prefix}-ctA" -- ip link add link eth0 name eth0.2 type vlan id 2
     lxc exec "${prefix}-ctA" -- ip link set eth0.2 up
     lxc exec "${prefix}-ctA" -- ip a add 192.0.2.1/24 dev eth0.2
-    ! lxc exec "${prefix}-ctA" -- ping -c2 -W5 192.0.2.2 || false
-    ! lxc exec "${prefix}-ctB" -- ping -c2 -W5 192.0.2.1 || false
+    ! lxc exec "${prefix}-ctA" -- ping -nc2 -i0.1 -W1 192.0.2.2 || false
+    ! lxc exec "${prefix}-ctB" -- ping -nc2 -i0.1 -W1 192.0.2.1 || false
     lxc stop -f "${prefix}-ctA"
     lxc config device remove "${prefix}-ctA" eth0
   fi
@@ -65,8 +64,8 @@ test_container_devices_nic_bridged_vlan() {
     lxc exec "${prefix}-ctA" -- ip link set eth0.2 up
     lxc exec "${prefix}-ctA" -- ip a add 192.0.2.1/24 dev eth0.2
     lxc exec "${prefix}-ctA" -- ip link set eth0.2 address 00:16:3e:92:f3:c1
-    ! lxc exec "${prefix}-ctA" -- ping -c2 -W5 192.0.2.2 || false
-    ! lxc exec "${prefix}-ctB" -- ping -c2 -W5 192.0.2.1 || false
+    ! lxc exec "${prefix}-ctA" -- ping -nc2 -i0.1 -W1 192.0.2.2 || false
+    ! lxc exec "${prefix}-ctB" -- ping -nc2 -i0.1 -W1 192.0.2.1 || false
     lxc stop -f "${prefix}-ctA"
     lxc config device remove "${prefix}-ctA" eth0
   fi
@@ -75,17 +74,17 @@ test_container_devices_nic_bridged_vlan() {
   lxc config device override "${prefix}-ctA" eth0 vlan=2 # Test valid untagged VLAN ID.
   lxc config device set "${prefix}-ctA" eth0 vlan.tagged="3, 4,5" # Test valid tagged VLAN ID list.
   lxc config device set "${prefix}-ctA" eth0 vlan.tagged="3,4-6" # Test valid tagged VLAN ID list with range.
-  ! lxc config device set "${prefix}-ctA" eth0 vlan.tagged=3,2,4 # Test same tagged VLAN ID as untagged VLAN ID.
-  ! lxc config device set "${prefix}-ctA" eth0 security.ipv4_filtering = true # Can't use IP filtering with VLANs.
-  ! lxc config device set "${prefix}-ctA" eth0 security.ipv6_filtering = true # Can't use IP filtering with VLANs.
-  ! lxc config device set "${prefix}-ctA" eth0 vlan = invalid # Check invalid VLAN ID.
-  ! lxc config device set "${prefix}-ctA" eth0 vlan = 4096 # Check out of range VLAN ID.
-  ! lxc config device set "${prefix}-ctA" eth0 vlan = 0 # Check out of range VLAN ID.
-  ! lxc config device set "${prefix}-ctA" eth0 vlan.tagged = 5,invalid, 6 # Check invalid VLAN ID list.
-  ! lxc config device set "${prefix}-ctA" eth0 vlan.tagged=-1 # Check out of range VLAN ID list.
-  ! lxc config device set "${prefix}-ctA" eth0 vlan.tagged=4096 # Check out of range VLAN ID list.
-  ! lxc config device set "${prefix}-ctA" eth0 vlan.tagged=1,2,-3-4 # Check invalid VLAN ID range input
-  ! lxc config device set "${prefix}-ctA" eth0 vlan.tagged=1,2,4-3 # Check invalid VLAN ID range boundary (declining range)
+  ! lxc config device set "${prefix}-ctA" eth0 vlan.tagged=3,2,4 || false # Test same tagged VLAN ID as untagged VLAN ID.
+  ! lxc config device set "${prefix}-ctA" eth0 security.ipv4_filtering=true || false # Can't use IP filtering with VLANs.
+  ! lxc config device set "${prefix}-ctA" eth0 security.ipv6_filtering=true || false # Can't use IP filtering with VLANs.
+  ! lxc config device set "${prefix}-ctA" eth0 vlan=invalid || false # Check invalid VLAN ID.
+  ! lxc config device set "${prefix}-ctA" eth0 vlan=4096 || false # Check out of range VLAN ID.
+  ! lxc config device set "${prefix}-ctA" eth0 vlan=0 || false # Check out of range VLAN ID.
+  ! lxc config device set "${prefix}-ctA" eth0 vlan.tagged="5,invalid, 6" || false # Check invalid VLAN ID list.
+  ! lxc config device set "${prefix}-ctA" eth0 vlan.tagged=-1 || false # Check out of range VLAN ID list.
+  ! lxc config device set "${prefix}-ctA" eth0 vlan.tagged=4096 || false # Check out of range VLAN ID list.
+  ! lxc config device set "${prefix}-ctA" eth0 vlan.tagged=1,2,-3-4 || false # Check invalid VLAN ID range input
+  ! lxc config device set "${prefix}-ctA" eth0 vlan.tagged=1,2,4-3 || false # Check invalid VLAN ID range boundary (declining range)
   lxc config device remove "${prefix}-ctA" eth0
 
   # Test untagged VLANs (and that tagged VLANs are filtered).
@@ -108,10 +107,10 @@ test_container_devices_nic_bridged_vlan() {
   lxc exec "${prefix}-ctB" -- ip link add link eth0 name eth0.3 type vlan id 3
   lxc exec "${prefix}-ctB" -- ip link set eth0.3 up
   lxc exec "${prefix}-ctB" -- ip a add 192.0.3.2/24 dev eth0.3
-  lxc exec "${prefix}-ctA" -- ping -c2 -W5 192.0.2.2
-  lxc exec "${prefix}-ctB" -- ping -c2 -W5 192.0.2.1
-  ! lxc exec "${prefix}-ctA" -- ping -c2 -W5 192.0.3.2 || false
-  ! lxc exec "${prefix}-ctB" -- ping -c2 -W5 192.0.3.1 || false
+  lxc exec "${prefix}-ctA" -- ping -nc2 -i0.1 -W1 192.0.2.2
+  lxc exec "${prefix}-ctB" -- ping -nc2 -i0.1 -W1 192.0.2.1
+  ! lxc exec "${prefix}-ctA" -- ping -nc2 -i0.1 -W1 192.0.3.2 || false
+  ! lxc exec "${prefix}-ctB" -- ping -nc2 -i0.1 -W1 192.0.3.1 || false
   lxc stop -f "${prefix}-ctA"
   lxc config device remove "${prefix}-ctA" eth0
   lxc stop -f "${prefix}-ctB"
@@ -136,10 +135,10 @@ test_container_devices_nic_bridged_vlan() {
   lxc exec "${prefix}-ctB" -- ip link add link eth0 name eth0.2 type vlan id 2
   lxc exec "${prefix}-ctB" -- ip link set eth0.2 up
   lxc exec "${prefix}-ctB" -- ip a add 192.0.2.2/24 dev eth0.2
-  lxc exec "${prefix}-ctA" -- ping -c2 -W5 192.0.2.2
-  lxc exec "${prefix}-ctB" -- ping -c2 -W5 192.0.2.1
-  ! lxc exec "${prefix}-ctA" -- ping -c2 -W5 192.0.3.2 || false
-  ! lxc exec "${prefix}-ctB" -- ping -c2 -W5 192.0.3.1 || false
+  lxc exec "${prefix}-ctA" -- ping -nc2 -i0.1 -W1 192.0.2.2
+  lxc exec "${prefix}-ctB" -- ping -nc2 -i0.1 -W1 192.0.2.1
+  ! lxc exec "${prefix}-ctA" -- ping -nc2 -i0.1 -W1 192.0.3.2 || false
+  ! lxc exec "${prefix}-ctB" -- ping -nc2 -i0.1 -W1 192.0.3.1 || false
   lxc stop -f "${prefix}-ctA"
   lxc config device remove "${prefix}-ctA" eth0
   lxc stop -f "${prefix}-ctB"
@@ -152,7 +151,7 @@ test_container_devices_nic_bridged_vlan() {
     echo 0 > "/sys/class/net/${prefix}B/bridge/vlan_filtering"
     echo 2 > "/sys/class/net/${prefix}B/bridge/default_pvid"
     lxc config device override "${prefix}-ctA" eth0 parent="${prefix}B" vlan.tagged=3
-    ! lxc start "${prefix}-ctA" # Check it fails to start with vlan_filtering disabled.
+    ! lxc start "${prefix}-ctA" || false # Check it fails to start with vlan_filtering disabled.
     echo 1 > "/sys/class/net/${prefix}B/bridge/vlan_filtering"
     lxc start "${prefix}-ctA"
     lxc exec "${prefix}-ctA" -- ip link set eth0 up
@@ -161,8 +160,8 @@ test_container_devices_nic_bridged_vlan() {
     lxc start "${prefix}-ctB"
     lxc exec "${prefix}-ctB" -- ip link set eth0 up
     lxc exec "${prefix}-ctB" -- ip a add 192.0.2.2/24 dev eth0
-    lxc exec "${prefix}-ctA" -- ping -c2 -W5 192.0.2.2
-    lxc exec "${prefix}-ctB" -- ping -c2 -W5 192.0.2.1
+    lxc exec "${prefix}-ctA" -- ping -nc2 -i0.1 -W1 192.0.2.2
+    lxc exec "${prefix}-ctB" -- ping -nc2 -i0.1 -W1 192.0.2.1
     lxc stop -f "${prefix}-ctA"
     lxc config device remove "${prefix}-ctA" eth0
     lxc stop -f "${prefix}-ctB"

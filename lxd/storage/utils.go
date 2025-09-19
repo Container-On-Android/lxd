@@ -17,9 +17,11 @@ import (
 
 	"github.com/canonical/lxd/lxd/apparmor"
 	"github.com/canonical/lxd/lxd/archive"
+	"github.com/canonical/lxd/lxd/config"
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/db/cluster"
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
+	"github.com/canonical/lxd/lxd/device/filters"
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/migration"
@@ -462,7 +464,7 @@ func poolAndVolumeCommonRules(vol *drivers.Volume) map[string]func(string) error
 		//  shortdesc: Size/quota of the storage bucket
 		//  scope: local
 		"size": validate.Optional(validate.IsSize),
-		// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex,storage-pure; group=volume-conf; key=snapshots.expiry)
+		// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex,storage-pure,storage-alletra; group=volume-conf; key=snapshots.expiry)
 		// Specify an expression like `1M 2H 3d 4w 5m 6y`.
 		// ---
 		//  type: string
@@ -475,7 +477,7 @@ func poolAndVolumeCommonRules(vol *drivers.Volume) map[string]func(string) error
 			_, err := shared.GetExpiry(time.Time{}, value)
 			return err
 		},
-		// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex,storage-pure; group=volume-conf; key=snapshots.schedule)
+		// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex,storage-pure,storage-alletra; group=volume-conf; key=snapshots.schedule)
 		// Specify either a cron expression (`<minute> <hour> <dom> <month> <dow>`), a comma-separated list of schedule aliases (`@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@annually`, `@yearly`), or leave empty to disable automatic snapshots (the default).
 		// ---
 		//  type: string
@@ -484,7 +486,7 @@ func poolAndVolumeCommonRules(vol *drivers.Volume) map[string]func(string) error
 		//  shortdesc: Schedule for automatic volume snapshots
 		//  scope: global
 		"snapshots.schedule": validate.Optional(validate.IsCron([]string{"@hourly", "@daily", "@midnight", "@weekly", "@monthly", "@annually", "@yearly"})),
-		// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex,storage-pure; group=volume-conf; key=snapshots.pattern)
+		// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex,storage-pure,storage-alletra; group=volume-conf; key=snapshots.pattern)
 		// You can specify a naming template that is used for scheduled snapshots and unnamed snapshots.
 		//
 		// {{snapshot_pattern_detail}}
@@ -499,7 +501,7 @@ func poolAndVolumeCommonRules(vol *drivers.Volume) map[string]func(string) error
 
 	// security.shifted and security.unmapped are only relevant for custom filesystem volumes.
 	if vol == nil || (vol.Type() == drivers.VolumeTypeCustom && vol.ContentType() == drivers.ContentTypeFS) {
-		// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex; group=volume-conf; key=security.shifted)
+		// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex,storage-pure,storage-alletra; group=volume-conf; key=security.shifted)
 		// Enabling this option allows attaching the volume to multiple isolated instances.
 		// ---
 		//  type: bool
@@ -508,7 +510,7 @@ func poolAndVolumeCommonRules(vol *drivers.Volume) map[string]func(string) error
 		//  shortdesc: Enable ID shifting overlay
 		//  scope: global
 		rules["security.shifted"] = validate.Optional(validate.IsBool)
-		// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex; group=volume-conf; key=security.unmapped)
+		// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex,storage-pure,storage-alletra; group=volume-conf; key=security.unmapped)
 		//
 		// ---
 		//  type: bool
@@ -521,7 +523,7 @@ func poolAndVolumeCommonRules(vol *drivers.Volume) map[string]func(string) error
 
 	// security.shared guards virtual-machine and custom block volumes.
 	if vol == nil || ((vol.Type() == drivers.VolumeTypeCustom || vol.Type() == drivers.VolumeTypeVM) && vol.ContentType() == drivers.ContentTypeBlock) {
-		// lxdmeta:generate(entities=storage-btrfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex; group=volume-conf; key=security.shared)
+		// lxdmeta:generate(entities=storage-btrfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex,storage-pure,storage-alletra; group=volume-conf; key=security.shared)
 		// Enabling this option allows sharing the volume across multiple instances despite the possibility of data loss.
 		//
 		// ---
@@ -535,7 +537,7 @@ func poolAndVolumeCommonRules(vol *drivers.Volume) map[string]func(string) error
 
 	// Those keys are only valid for volumes.
 	if vol != nil {
-		// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex,storage-pure; group=volume-conf; key=volatile.uuid)
+		// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex,storage-pure,storage-alletra; group=volume-conf; key=volatile.uuid)
 		//
 		// ---
 		//  type: string
@@ -543,6 +545,15 @@ func poolAndVolumeCommonRules(vol *drivers.Volume) map[string]func(string) error
 		//  shortdesc: The volume's UUID
 		//  scope: global
 		rules["volatile.uuid"] = validate.Optional(validate.IsUUID)
+
+		// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex,storage-pure,storage-alletra; group=volume-conf; key=volatile.devlxd.owner)
+		//
+		// ---
+		//  type: string
+		//  defaultdesc: DevLXD owner identity ID
+		//  shortdesc: The ID of the DevLXD identity which owns the volume
+		//  scope: global
+		rules["volatile.devlxd.owner"] = validate.Optional(validate.IsUUID)
 	}
 
 	return rules
@@ -603,7 +614,7 @@ func validatePoolCommonRules() map[string]func(string) error {
 		//  scope: local
 		"source.wipe":             validate.Optional(validate.IsBool),
 		"volatile.initial_source": validate.IsAny,
-		// lxdmeta:generate(entities=storage-dir,storage-lvm,storage-powerflex; group=pool-conf; key=rsync.bwlimit)
+		// lxdmeta:generate(entities=storage-dir,storage-lvm,storage-powerflex,storage-pure,storage-alletra; group=pool-conf; key=rsync.bwlimit)
 		// When `rsync` must be used to transfer storage entities, this option specifies the upper limit
 		// to be placed on the socket I/O.
 		// ---
@@ -612,7 +623,7 @@ func validatePoolCommonRules() map[string]func(string) error {
 		//  shortdesc: Upper limit on the socket I/O for `rsync`
 		//  scope: global
 		"rsync.bwlimit": validate.Optional(validate.IsSize),
-		// lxdmeta:generate(entities=storage-dir,storage-lvm,storage-powerflex; group=pool-conf; key=rsync.compression)
+		// lxdmeta:generate(entities=storage-dir,storage-lvm,storage-powerflex,storage-pure,storage-alletra; group=pool-conf; key=rsync.compression)
 		//
 		// ---
 		//  type: bool
@@ -634,14 +645,14 @@ func validatePoolCommonRules() map[string]func(string) error {
 func validateVolumeCommonRules(vol drivers.Volume) map[string]func(string) error {
 	rules := poolAndVolumeCommonRules(&vol)
 
-	// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex; group=volume-conf; key=volatile.idmap.last)
+	// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex,storage-pure,storage-alletra; group=volume-conf; key=volatile.idmap.last)
 	//
 	// ---
 	//   type: string
 	//   shortdesc: JSON-serialized UID/GID map that has been applied to the volume
 	//   condition: filesystem
 
-	// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex; group=volume-conf; key=volatile.idmap.next)
+	// lxdmeta:generate(entities=storage-btrfs,storage-cephfs,storage-ceph,storage-dir,storage-lvm,storage-zfs,storage-powerflex,storage-pure,storage-alletra; group=volume-conf; key=volatile.idmap.next)
 	//
 	// ---
 	//   type: string
@@ -683,7 +694,7 @@ func validateVolumeCommonRules(vol drivers.Volume) map[string]func(string) error
 // VM Format A: Separate metadata tarball and root qcow2 file.
 //   - Unpack metadata tarball into mountPath.
 //   - Check rootBlockPath is a file and convert qcow2 file into raw format in rootBlockPath.
-func ImageUnpack(s *state.State, imageFile string, vol drivers.Volume, destBlockFile string, allowUnsafeResize bool, tracker *ioprogress.ProgressTracker) (int64, error) {
+func ImageUnpack(s *state.State, projectName string, imageFile string, vol drivers.Volume, destBlockFile string, allowUnsafeResize bool, tracker *ioprogress.ProgressTracker) (int64, error) {
 	l := logger.Log.AddContext(logger.Ctx{"imageFile": imageFile, "volName": vol.Name()})
 	l.Info("Image unpack started")
 	defer l.Info("Image unpack stopped")
@@ -837,7 +848,7 @@ func ImageUnpack(s *state.State, imageFile string, vol drivers.Volume, destBlock
 		}
 	} else {
 		// Dealing with unified tarballs require an initial unpack to a temporary directory.
-		tempDir, err := os.MkdirTemp(s.ImagesStoragePath(), "lxd_image_unpack_")
+		tempDir, err := os.MkdirTemp(s.ImagesStoragePath(projectName), "lxd_image_unpack_")
 		if err != nil {
 			return -1, err
 		}
@@ -928,7 +939,7 @@ func volumeIsUsedByDevice(vol api.StorageVolume, instanceType instancetype.Type,
 		return false, nil
 	}
 
-	if instanceType != instancetype.Any && instancetype.IsRootDiskDevice(dev) {
+	if instanceType != instancetype.Any && filters.IsRootDisk(dev) {
 		rootVolumeType, err := InstanceTypeToVolumeType(instanceType)
 		if err != nil {
 			return false, err
@@ -1172,26 +1183,28 @@ func VolumeUsedByExclusiveRemoteInstancesWithProfiles(s *state.State, poolName s
 
 // VolumeUsedByDaemon indicates whether the volume is used by daemon storage.
 func VolumeUsedByDaemon(s *state.State, poolName string, volumeName string) (bool, error) {
-	var storageBackups string
-	var storageImages string
-	err := s.DB.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
-		nodeConfig, err := node.ConfigLoad(ctx, tx)
-		if err != nil {
-			return err
-		}
-
-		storageBackups = nodeConfig.StorageBackupsVolume()
-		storageImages = nodeConfig.StorageImagesVolume()
-
-		return nil
+	var nodeConfig *node.Config
+	var err error
+	err = s.DB.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
+		nodeConfig, err = node.ConfigLoad(ctx, tx)
+		return err
 	})
 	if err != nil {
 		return false, err
 	}
 
+	// Check if volume is referenced in project level storage settings.
 	fullName := poolName + "/" + volumeName
-	if storageBackups == fullName || storageImages == fullName {
-		return true, nil
+	for configKey, value := range nodeConfig.Dump() {
+		// Skip any keys that are not storage volumes related.
+		_, storageType := config.ParseDaemonStorageConfigKey(configKey)
+		if storageType == "" {
+			continue
+		}
+
+		if value == fullName {
+			return true, nil
+		}
 	}
 
 	return false, nil
@@ -1344,23 +1357,6 @@ func CompareSnapshots(sourceSnapshots []ComparableSnapshot, targetSnapshots []Co
 	}
 
 	return syncFromSource, deleteFromTarget
-}
-
-// ValidVolumeName validates a volume name.
-func ValidVolumeName(volumeName string) error {
-	if volumeName == "" {
-		return errors.New("Invalid volume name: Cannot be empty")
-	}
-
-	if strings.Contains(volumeName, "\\") {
-		return fmt.Errorf("Invalid volume name %q: Cannot contain backslashes", volumeName)
-	}
-
-	if strings.Contains(volumeName, shared.SnapshotDelimiter) {
-		return fmt.Errorf("Invalid volume name %q: Cannot contain slashes", volumeName)
-	}
-
-	return nil
 }
 
 // GetPoolDefaultBlockSize returns the default block size for the specified storage pool according to its driver.

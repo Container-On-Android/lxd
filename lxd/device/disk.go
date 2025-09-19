@@ -21,6 +21,7 @@ import (
 	"github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/db/warningtype"
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
+	"github.com/canonical/lxd/lxd/device/filters"
 	"github.com/canonical/lxd/lxd/idmap"
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
@@ -380,6 +381,8 @@ func (d *disk) validateConfig(instConf instance.ConfigReader) error {
 		"boot.priority": validate.Optional(validate.IsUint32),
 		// lxdmeta:generate(entities=device-disk; group=device-conf; key=path)
 		// This option specifies the path inside the container where the disk will be mounted.
+		// For containers, this option allows mounting filesystem disk devices, as well as specific paths and individual files within those devices.
+		// For VMs, this option allows mounting filesystem disk devices and paths within them. Mounting individual files is not supported.
 		// ---
 		//  type: string
 		//  required: yes
@@ -419,6 +422,10 @@ func (d *disk) validateConfig(instConf instance.ConfigReader) error {
 	err := d.config.Validate(rules)
 	if err != nil {
 		return err
+	}
+
+	if instConf.Type() == instancetype.Container && d.config["io.threads"] != "" {
+		return errors.New("IO threads configuration cannot be applied to containers")
 	}
 
 	if instConf.Type() == instancetype.Container && d.config["io.bus"] != "" {
@@ -519,14 +526,14 @@ func (d *disk) validateConfig(instConf instance.ConfigReader) error {
 		var storageProjectName string
 
 		// Check if validating an instance or a custom storage volume attached to a profile.
-		if (d.inst != nil && !d.inst.IsSnapshot()) || (d.inst == nil && instConf.Type() == instancetype.Any && !instancetype.IsRootDiskDevice(d.config)) {
+		if (d.inst != nil && !d.inst.IsSnapshot()) || (d.inst == nil && instConf.Type() == instancetype.Any && !filters.IsRootDisk(d.config)) {
 			d.pool, err = storagePools.LoadByName(d.state, d.config["pool"])
 			if err != nil {
 				return fmt.Errorf("Failed to get storage pool %q: %w", d.config["pool"], err)
 			}
 
 			// Non-root volume validation.
-			if !instancetype.IsRootDiskDevice(d.config) {
+			if !filters.IsRootDisk(d.config) {
 				volumeName, volumeType, dbVolumeType, err := d.sourceVolumeFields()
 				if err != nil {
 					return err
@@ -615,7 +622,7 @@ func (d *disk) validateConfig(instConf instance.ConfigReader) error {
 			}
 
 			if len(initialConfig) > 0 {
-				if !instancetype.IsRootDiskDevice(d.config) {
+				if !filters.IsRootDisk(d.config) {
 					return errors.New("Non-root disk device cannot contain initial.* configuration")
 				}
 
@@ -864,7 +871,7 @@ func (d *disk) startContainer() (*deviceConfig.RunConfig, error) {
 	defer revert.Fail()
 
 	// Deal with a rootfs.
-	if instancetype.IsRootDiskDevice(d.config) {
+	if filters.IsRootDisk(d.config) {
 		// Set the rootfs path.
 		rootfs := deviceConfig.RootFSEntryItem{
 			Path: d.inst.RootfsPath(),
@@ -1074,7 +1081,7 @@ func (d *disk) startVM() (*deviceConfig.RunConfig, error) {
 		}
 	}
 
-	if instancetype.IsRootDiskDevice(d.config) {
+	if filters.IsRootDisk(d.config) {
 		// Handle previous requests for setting new quotas.
 		err := d.applyDeferredQuota()
 		if err != nil {
@@ -1372,6 +1379,11 @@ func (d *disk) startVM() (*deviceConfig.RunConfig, error) {
 					return nil, err
 				}
 
+				// Forbid mounting files to FS paths.
+				if d.config["path"] != "" {
+					return nil, errors.New("File mounting to filesystem paths is not supported for virtual machines")
+				}
+
 				revert.Add(func() { _ = f.Close() })
 				runConf.PostHooks = append(runConf.PostHooks, f.Close)
 				runConf.Revert = func() { _ = f.Close() } // Close file on VM start failure.
@@ -1413,7 +1425,7 @@ func (d *disk) postStart() error {
 
 // Update applies configuration changes to a started device.
 func (d *disk) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
-	if instancetype.IsRootDiskDevice(d.config) {
+	if filters.IsRootDisk(d.config) {
 		// Make sure we have a valid root disk device (and only one).
 		expandedDevices := d.inst.ExpandedDevices()
 		newRootDiskDeviceKey, _, err := instancetype.GetRootDiskDevice(expandedDevices.CloneNative())
@@ -1424,7 +1436,7 @@ func (d *disk) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 		// Retrieve the first old root disk device key, even if there are duplicates.
 		oldRootDiskDeviceKey := ""
 		for k, v := range oldDevices {
-			if instancetype.IsRootDiskDevice(v) {
+			if filters.IsRootDisk(v) {
 				oldRootDiskDeviceKey = k
 				break
 			}
@@ -1455,7 +1467,11 @@ func (d *disk) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 			}
 
 			err := d.applyQuota(false)
-			if errors.Is(err, storageDrivers.ErrInUse) {
+			if err != nil {
+				if !errors.Is(err, storageDrivers.ErrInUse) {
+					return err
+				}
+
 				// Save volatile apply_quota key for next boot if cannot apply now.
 				err = d.volatileSet(map[string]string{"apply_quota": "true"})
 				if err != nil {
@@ -1463,8 +1479,6 @@ func (d *disk) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 				}
 
 				d.logger.Warn("Could not apply quota because disk is in use, deferring until next start")
-			} else if err != nil {
-				return err
 			}
 		}
 	}
@@ -1582,11 +1596,7 @@ func (d *disk) applyQuota(remount bool) error {
 func (d *disk) generateLimits(runConf *deviceConfig.RunConfig) error {
 	// Disk throttle limits.
 	hasDiskLimits := false
-	for _, dev := range d.inst.ExpandedDevices() {
-		if dev["type"] != "disk" {
-			continue
-		}
-
+	for _, dev := range d.inst.ExpandedDevices().Filter(filters.IsDisk) {
 		if dev["limits.read"] != "" || dev["limits.write"] != "" || dev["limits.max"] != "" {
 			hasDiskLimits = true
 		}
@@ -2264,11 +2274,7 @@ func (d *disk) getDiskLimits() (map[string]diskBlockLimit, error) {
 
 	// Process all the limits
 	blockLimits := map[string][]diskBlockLimit{}
-	for devName, dev := range d.inst.ExpandedDevices() {
-		if dev["type"] != "disk" {
-			continue
-		}
-
+	for devName, dev := range d.inst.ExpandedDevices().Filter(filters.IsDisk) {
 		// Parse the user input
 		readBps, readIops, writeBps, writeIops, err := d.parseLimit(dev)
 		if err != nil {

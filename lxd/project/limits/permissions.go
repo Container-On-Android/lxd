@@ -292,7 +292,7 @@ func AllowVolumeCreation(ctx context.Context, globalConfig *clusterConfig.Config
 //
 // If no limit is in place, return -1.
 func GetImageSpaceBudget(ctx context.Context, globalConfig *clusterConfig.Config, tx *db.ClusterTx, projectName string) (int64, error) {
-	var globalConfigDump map[string]any
+	var globalConfigDump map[string]string
 	if globalConfig != nil {
 		globalConfigDump = globalConfig.Dump()
 	}
@@ -365,7 +365,7 @@ func checkRestrictionsAndAggregateLimits(globalConfig *clusterConfig.Config, tx 
 		return nil
 	}
 
-	var globalConfigDump map[string]any
+	var globalConfigDump map[string]string
 	if globalConfig != nil {
 		globalConfigDump = globalConfig.Dump()
 	}
@@ -1076,7 +1076,7 @@ func checkUplinkUse(ctx context.Context, tx *db.ClusterTx, projectName string, c
 
 // AllowProjectUpdate checks the new config to be set on a project is valid.
 func AllowProjectUpdate(ctx context.Context, globalConfig *clusterConfig.Config, tx *db.ClusterTx, projectName string, config map[string]string, changed []string) error {
-	var globalConfigDump map[string]any
+	var globalConfigDump map[string]string
 	if globalConfig != nil {
 		globalConfigDump = globalConfig.Dump()
 	}
@@ -1090,6 +1090,9 @@ func AllowProjectUpdate(ctx context.Context, globalConfig *clusterConfig.Config,
 	if err != nil {
 		return err
 	}
+
+	restrictedValue, ok := info.Project.Config["restricted"]
+	projectIsRestricted := ok && shared.IsTrue(restrictedValue)
 
 	// List of keys that need to check aggregate values across all project
 	// instances.
@@ -1110,9 +1113,11 @@ func AllowProjectUpdate(ctx context.Context, globalConfig *clusterConfig.Config,
 				Config: config,
 			}
 
-			err := checkInstanceRestrictions(project, info.Instances, info.Profiles)
-			if err != nil {
-				return fmt.Errorf("Conflict detected when changing %q in project %q: %w", key, projectName, err)
+			if projectIsRestricted {
+				err := checkInstanceRestrictions(project, info.Instances, info.Profiles)
+				if err != nil {
+					return fmt.Errorf("Conflict detected when changing %q in project %q: %w", key, projectName, err)
+				}
 			}
 
 			continue
@@ -1331,7 +1336,7 @@ func fetchProject(ctx context.Context, tx *db.ClusterTx, projectName string, ski
 
 // Expand the configuration and devices of the given instances, taking the give
 // project profiles into account.
-func expandInstancesConfigAndDevices(globalConfig map[string]any, instances []api.Instance, profiles []api.Profile) ([]api.Instance, error) {
+func expandInstancesConfigAndDevices(globalConfig map[string]string, instances []api.Instance, profiles []api.Profile) ([]api.Instance, error) {
 	expandedInstances := make([]api.Instance, len(instances))
 
 	// Index of all profiles by name.

@@ -14,7 +14,7 @@ test_oidc() {
 
   # Setup OIDC
   spawn_oidc
-  lxc config set "oidc.issuer=http://127.0.0.1:$(cat "${TEST_DIR}/oidc.port")/"
+  lxc config set "oidc.issuer=http://127.0.0.1:$(< "${TEST_DIR}/oidc.port")/"
   lxc config set "oidc.client.id=device"
 
   # Expect this to fail. No user set.
@@ -38,7 +38,7 @@ test_oidc() {
   [ "$(lxc query oidc:/1.0 | jq -r '.auth_user_name')" = "test-user@example.com" ]
 
   # OIDC user should be added to identities table.
-  [ "$(lxd sql global --format csv "SELECT count(*) FROM identities WHERE type = 5 AND identifier = 'test-user@example.com' AND auth_method = 2")" = 1 ]
+  [ "$(lxd sql global --format csv "SELECT COUNT(*) FROM identities WHERE type = 5 AND identifier = 'test-user@example.com' AND auth_method = 2")" = 1 ]
 
   # Cleanup OIDC
   lxc auth identity delete oidc/test-user@example.com

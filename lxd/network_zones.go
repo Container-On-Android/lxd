@@ -11,7 +11,6 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/canonical/lxd/lxd/auth"
-	clusterRequest "github.com/canonical/lxd/lxd/cluster/request"
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/network/zone"
@@ -20,7 +19,6 @@ import (
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/lxd/util"
-	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
 	"github.com/canonical/lxd/shared/version"
@@ -54,7 +52,7 @@ type networkZoneDetails struct {
 	requestProject api.Project
 }
 
-// addNetworkZoneDetailsToRequestContext sets request.CtxEffectiveProjectName (string) and ctxNetworkZoneDetails (networkZoneDetails)
+// addNetworkZoneDetailsToRequestContext sets the effective project in the request.Info and sets ctxNetworkZoneDetails (networkZoneDetails)
 // in the request context.
 func addNetworkZoneDetailsToRequestContext(s *state.State, r *http.Request) error {
 	zoneName, err := url.PathUnescape(mux.Vars(r)["zone"])
@@ -68,9 +66,7 @@ func addNetworkZoneDetailsToRequestContext(s *state.State, r *http.Request) erro
 		return fmt.Errorf("Failed to check project %q network feature: %w", requestProjectName, err)
 	}
 
-	reqInfo := request.SetupContextInfo(r)
-	reqInfo.EffectiveProjectName = effectiveProjectName
-
+	request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
 	request.SetContextValue(r, ctxNetworkZoneDetails, networkZoneDetails{
 		zoneName:       zoneName,
 		requestProject: *requestProject,
@@ -210,21 +206,13 @@ func networkZoneAccessHandler(entitlement auth.Entitlement) func(d *Daemon, r *h
 func networkZonesGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	allProjects := shared.IsTrue(request.QueryParam(r, "all-projects"))
-	requestProjectName := request.QueryParam(r, "project")
-
-	// requestProjectName is only valid for project specific requests.
-	if allProjects && requestProjectName != "" {
-		return response.BadRequest(errors.New("Cannot specify a project when requesting all projects"))
+	requestProjectName, allProjects, err := request.ProjectParams(r)
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	var effectiveProjectName string
-	var err error
 	if !allProjects {
-		if requestProjectName == "" {
-			requestProjectName = api.ProjectDefaultName
-		}
-
 		// Project specific requests require an effective project, when "features.networks.zones" is enabled this is the requested project, otherwise it is the default project.
 		effectiveProjectName, _, err = project.NetworkZoneProject(s.DB.Cluster, requestProjectName)
 		if err != nil {
@@ -232,8 +220,7 @@ func networkZonesGet(d *Daemon, r *http.Request) response.Response {
 		}
 
 		// If the request is project specific, then set effective project name in the request context so that the authorizer can generate the correct URL.
-		reqInfo := request.SetupContextInfo(r)
-		reqInfo.EffectiveProjectName = effectiveProjectName
+		request.SetContextValue(r, request.CtxEffectiveProjectName, effectiveProjectName)
 	}
 
 	recursion := util.IsRecursionRequest(r)
@@ -309,7 +296,7 @@ func networkZonesGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	if len(withEntitlements) > 0 {
-		err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeNetworkZone, withEntitlements, urlToNetworkZone)
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeNetworkZone, withEntitlements, urlToNetworkZone)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -415,10 +402,9 @@ func networkZonesPost(d *Daemon, r *http.Request) response.Response {
 func networkZoneDelete(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	var effectiveProjectName string
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo != nil {
-		effectiveProjectName = reqInfo.EffectiveProjectName
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	details, err := request.GetContextValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
@@ -426,19 +412,29 @@ func networkZoneDelete(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	netzone, err := zone.LoadByNameAndProject(s, effectiveProjectName, details.zoneName)
+	err = doNetworkZoneDelete(r.Context(), s, details.zoneName, effectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
+	}
+
+	return response.EmptySyncResponse
+}
+
+// doNetworkZoneDelete deletes the named network zone in the given project.
+func doNetworkZoneDelete(ctx context.Context, s *state.State, zoneName string, projectName string) error {
+	netzone, err := zone.LoadByNameAndProject(s, projectName, zoneName)
+	if err != nil {
+		return err
 	}
 
 	err = netzone.Delete()
 	if err != nil {
-		return response.SmartError(err)
+		return fmt.Errorf("Failed deleting network zone %q: %w", zoneName, err)
 	}
 
-	s.Events.SendLifecycle(effectiveProjectName, lifecycle.NetworkZoneDeleted.Event(netzone, request.CreateRequestor(r.Context()), nil))
+	s.Events.SendLifecycle(projectName, lifecycle.NetworkZoneDeleted.Event(netzone, request.CreateRequestor(ctx), nil))
 
-	return response.EmptySyncResponse
+	return nil
 }
 
 // swagger:operation GET /1.0/network-zones/{zone} network-zones network_zone_get
@@ -484,10 +480,9 @@ func networkZoneDelete(d *Daemon, r *http.Request) response.Response {
 func networkZoneGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	var effectiveProjectName string
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo != nil {
-		effectiveProjectName = reqInfo.EffectiveProjectName
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	details, err := request.GetContextValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
@@ -514,7 +509,7 @@ func networkZoneGet(d *Daemon, r *http.Request) response.Response {
 	info.UsedBy = project.FilterUsedBy(r.Context(), s.Authorizer, info.UsedBy)
 
 	if len(withEntitlements) > 0 {
-		err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeNetworkZone, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.NetworkZoneURL(effectiveProjectName, details.zoneName): info})
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeNetworkZone, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.NetworkZoneURL(effectiveProjectName, details.zoneName): info})
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -595,10 +590,9 @@ func networkZoneGet(d *Daemon, r *http.Request) response.Response {
 func networkZonePut(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	var effectiveProjectName string
-	reqInfo := request.GetContextInfo(r.Context())
-	if reqInfo != nil {
-		effectiveProjectName = reqInfo.EffectiveProjectName
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	details, err := request.GetContextValue[networkZoneDetails](r.Context(), ctxNetworkZoneDetails)
@@ -637,14 +631,17 @@ func networkZonePut(d *Daemon, r *http.Request) response.Response {
 		}
 	}
 
-	clientType := clusterRequest.UserAgentClientType(r.Header.Get("User-Agent"))
-
-	err = netzone.Update(&req, clientType)
+	requestor, err := request.GetRequestor(r.Context())
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	s.Events.SendLifecycle(effectiveProjectName, lifecycle.NetworkZoneUpdated.Event(netzone, request.CreateRequestor(r.Context()), nil))
+	err = netzone.Update(&req, requestor.ClientType())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	s.Events.SendLifecycle(effectiveProjectName, lifecycle.NetworkZoneUpdated.Event(netzone, requestor.EventLifecycleRequestor(), nil))
 
 	return response.EmptySyncResponse
 }

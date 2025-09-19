@@ -737,7 +737,9 @@ func StringPrefixInSlice(key string, list []string) bool {
 
 // RemoveElementsFromSlice returns a slice equivalent to removing the given elements from the given list.
 // Elements not present in the list are ignored.
+// The input slice is cloned to avoid modifying the original slice.
 func RemoveElementsFromSlice[T comparable](list []T, elements ...T) []T {
+	list = slices.Clone(list)
 	for i := len(elements) - 1; i >= 0; i-- {
 		element := elements[i]
 		match := false
@@ -793,11 +795,6 @@ func IsFalse(value string) bool {
 // IsFalseOrEmpty returns true if value is empty or if IsFalse() returns true.
 func IsFalseOrEmpty(value string) bool {
 	return value == "" || IsFalse(value)
-}
-
-// IsUserConfig returns true if the key starts with the prefix "user.".
-func IsUserConfig(key string) bool {
-	return strings.HasPrefix(key, "user.")
 }
 
 // StringMapHasStringKey returns true if any of the supplied keys are present in the map.
@@ -1323,25 +1320,52 @@ func (r *ReadSeeker) Seek(offset int64, whence int) (int64, error) {
 }
 
 // RenderTemplate renders a pongo2 template.
-func RenderTemplate(template string, ctx pongo2.Context) (string, error) {
-	// Load template from string
-	tpl, err := pongo2.FromString("{% autoescape off %}" + template + "{% endautoescape %}")
-	if err != nil {
-		return "", err
+func RenderTemplate(template string, ctx pongo2.Context) (output string, err error) {
+	defer func() {
+		// Capture panics in the pongo2 template rendering.
+		// This is to prevent the server from crashing due to a template error.
+		r := recover()
+		if r != nil {
+			err = fmt.Errorf("Panic while rendering template: %v", r)
+		}
+	}()
+
+	// Create custom TemplateSet
+	set := pongo2.NewSet("restricted", pongo2.DefaultLoader)
+
+	// Ban tags that could be used to access the host's filesystem.
+	for _, tag := range []string{"extends", "import", "include", "ssi"} {
+		err := set.BanTag(tag)
+		if err != nil {
+			return "", fmt.Errorf("Failed to ban tag %q: %w", tag, err)
+		}
 	}
 
-	// Get rendered template
-	ret, err := tpl.Execute(ctx)
-	if err != nil {
-		return ret, err
+	// Prevent unbounded recursion while rendering templates. Normal use should not
+	// require more than 1 or 2 levels of recursion.
+	for range 3 {
+		// Load template from string
+		tpl, err := set.FromString("{% autoescape off %}" + template + "{% endautoescape %}")
+		if err != nil {
+			return "", err
+		}
+
+		// Get rendered template
+		ret, err := tpl.Execute(ctx)
+		if err != nil {
+			return "", err
+		}
+
+		// Check if another pass is needed.
+		if !strings.Contains(ret, "{{") && !strings.Contains(ret, "{%") {
+			return ret, nil
+		}
+
+		// Prepare for another pass.
+		template = ret
 	}
 
-	// Looks like we're nesting templates so run pongo again
-	if strings.Contains(ret, "{{") || strings.Contains(ret, "{%") {
-		return RenderTemplate(ret, ctx)
-	}
-
-	return ret, err
+	return "", errors.New("Recursion limit reached while rendering template")
 }
 
 // GetExpiry returns the expiry date based on the reference date and a length of time.
@@ -1474,8 +1498,9 @@ func JoinTokenDecode(input string) (*api.ClusterMemberJoinToken, error) {
 // TargetDetect returns either target node or group based on the provided prefix:
 // An invocation with `target=h1` returns "h1", "" and `target=@g1` returns "", "g1".
 func TargetDetect(target string) (targetNode string, targetGroup string) {
-	if strings.HasPrefix(target, "@") {
-		targetGroup = strings.TrimPrefix(target, "@")
+	after, found := strings.CutPrefix(target, "@")
+	if found {
+		targetGroup = after
 	} else {
 		targetNode = target
 	}

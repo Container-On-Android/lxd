@@ -108,6 +108,31 @@ test_basic_usage() {
   lxc list | grep foo | grep STOPPED
   lxc list fo | grep foo | grep STOPPED
 
+  echo "Invalid container names"
+  ! lxc init --empty ".." || false
+  # Escaping `\` multiple times due to `lxc` wrapper script munging the first layer
+  ! lxc init --empty "\\\\" || false
+  ! lxc init --empty "/" || false
+  ! lxc init --empty ";" || false
+
+  echo "Too small containers"
+  ! lxc init --empty c1 -c limits.memory=0 || false
+  ! lxc init --empty c1 -c limits.memory=0% || false
+
+  echo "Containers with snapshots"
+  lxc init testimage c1 -d "${SMALL_ROOT_DISK}"
+  lxc snapshot c1
+  # Invalid snapshot names
+  ! lxc snapshot c1 ".." || false
+  # Escaping `\` multiple times due to `lxc` wrapper script munging the first layer
+  ! lxc snapshot c1 "\\\\" || false
+  ! lxc snapshot c1 "/" || false
+  [ "$(lxc list -f csv -c S c1)" = "1" ]
+  lxc start c1
+  lxc snapshot c1
+  [ "$(lxc list -f csv -c S c1)" = "2" ]
+  lxc delete --force c1
+
   # Test list json format
   lxc list --format json | jq '.[]|select(.name="foo")' | grep '"name": "foo"'
 
@@ -290,12 +315,12 @@ test_basic_usage() {
   lxc delete -f "${RDNAME}"
 
   # Test "nonetype" container creation
-  wait_for "${LXD_ADDR}" my_curl -X POST "https://${LXD_ADDR}/1.0/containers" \
+  wait_for "${LXD_ADDR}" my_curl -X POST --fail-with-body -H 'Content-Type: application/json' "https://${LXD_ADDR}/1.0/containers" \
         -d "{\"name\":\"nonetype\",\"source\":{\"type\":\"none\"}}"
   lxc delete nonetype
 
   # Test "nonetype" container creation with an LXC config
-  wait_for "${LXD_ADDR}" my_curl -X POST "https://${LXD_ADDR}/1.0/containers" \
+  wait_for "${LXD_ADDR}" my_curl -X POST --fail-with-body -H 'Content-Type: application/json' "https://${LXD_ADDR}/1.0/containers" \
         -d "{\"name\":\"configtest\",\"config\":{\"raw.lxc\":\"lxc.hook.clone=/bin/true\"},\"source\":{\"type\":\"none\"}}"
   # shellcheck disable=SC2102
   [ "$(my_curl "https://${LXD_ADDR}/1.0/containers/configtest" | jq -r .metadata.config[\"raw.lxc\"])" = "lxc.hook.clone=/bin/true" ]
@@ -332,7 +357,7 @@ test_basic_usage() {
     ! lxd activateifneeded --debug 2>&1 | grep -F "activating..." || false
 
     lxc start autostart --force-local
-    PID=$(lxc info autostart --force-local | awk '/^PID:/ {print $2}')
+    PID="$(lxc list --force-local -f csv -c p autostart)"
     shutdown_lxd "${LXD_DIR}"
 
     # Stopping LXD should also stop the instances
@@ -467,7 +492,7 @@ test_basic_usage() {
   lxc profile delete clash
 
   # check that we can get the return code for a non- wait-for-websocket exec
-  op=$(my_curl -X POST "https://${LXD_ADDR}/1.0/containers/foo/exec" -d '{"command": ["echo", "test"], "environment": {}, "wait-for-websocket": false, "interactive": false}' | jq -r .operation)
+  op=$(my_curl -X POST --fail-with-body -H 'Content-Type: application/json' "https://${LXD_ADDR}/1.0/containers/foo/exec" -d '{"command": ["echo", "test"], "environment": {}, "wait-for-websocket": false, "interactive": false}' | jq -r .operation)
   [ "$(my_curl "https://${LXD_ADDR}${op}/wait" | jq -r .metadata.metadata.return)" != "null" ]
 
   # test file transfer
@@ -545,12 +570,12 @@ test_basic_usage() {
 
   if [ "$(awk '/^Seccomp:/ {print $2}' "/proc/self/status")" -eq "0" ]; then
     lxc launch testimage lxd-seccomp-test
-    init=$(lxc info lxd-seccomp-test | awk '/^PID:/ {print $2}')
+    init="$(lxc list -f csv -c p lxd-seccomp-test)"
     [ "$(awk '/^Seccomp:/ {print $2}' "/proc/${init}/status")" -eq "2" ]
     lxc stop --force lxd-seccomp-test
     lxc config set lxd-seccomp-test security.syscalls.deny_default false
     lxc start lxd-seccomp-test
-    init=$(lxc info lxd-seccomp-test | awk '/^PID:/ {print $2}')
+    init="$(lxc list -f csv -c p lxd-seccomp-test)"
     [ "$(awk '/^Seccomp:/ {print $2}' "/proc/${init}/status")" -eq "0" ]
     lxc delete --force lxd-seccomp-test
   else
@@ -613,12 +638,12 @@ test_basic_usage() {
 
   # Ephemeral
   lxc launch testimage foo --ephemeral
-  OLD_INIT=$(lxc info foo | awk '/^PID:/ {print $2}')
+  OLD_INIT="$(lxc list -f csv -c p foo)"
 
   REBOOTED="false"
 
   for _ in $(seq 60); do
-    NEW_INIT=$(lxc info foo | awk '/^PID:/ {print $2}' || true)
+    NEW_INIT="$(lxc list -f csv -c p foo)"
 
     # If init process is running, check if is old or new process.
     if [ -n "${NEW_INIT}" ]; then
@@ -748,10 +773,19 @@ EOF
 }
 
 test_basic_version() {
-  # XXX: add `fuidshift` to the list
-  for bin in lxc lxd lxd-agent lxd-benchmark lxd-migrate lxd-user; do
+  for bin in lxc lxd lxd-agent lxd-benchmark lxd-migrate lxd-user fuidshift; do
     "${bin}" --version
     "${bin}" --help
+  done
+
+  # lxd subcommands
+  for sub in activateifneeded callhook import init manpage migratedump netcat recover shutdown sql version waitready cluster; do
+      lxd "${sub}" --help
+  done
+
+  # lxd fork subcommands, except for: forkcoresched forkexec forkproxy forksyscall forkuevent
+  for sub in forkconsole forkdns forkfile forklimits forkmigrate forksyscallgo forkmount forknet forkstart forkzfs; do
+      lxd "${sub}" --help
   done
 }
 
@@ -770,4 +804,133 @@ test_server_info() {
   else
     lxc query /1.0 | jq -re '.environment.server_version' | grep -xE '[0-9]+\.[0-9]+'
   fi
+}
+
+test_duplicate_detection() {
+  ensure_import_testimage
+  test_image_fingerprint="$(lxc query /1.0/images/aliases/testimage | jq -r '.target')"
+
+  lxc auth group create foo
+  [ "$(! "${_LXC}" auth group create foo 2>&1 1>/dev/null)" = 'Error: Authorization group "foo" already exists' ]
+  lxc auth group create bar
+  [ "$(! "${_LXC}" auth group rename bar foo 2>&1 1>/dev/null)" = 'Error: Authorization group "foo" already exists' ]
+  lxc auth group delete foo
+  lxc auth group delete bar
+
+  lxc auth identity-provider-group create foo
+  [ "$(! "${_LXC}" auth identity-provider-group create foo 2>&1 1>/dev/null)" = 'Error: Identity provider group "foo" already exists' ]
+  lxc auth identity-provider-group create bar
+  [ "$(! "${_LXC}" auth identity-provider-group rename bar foo 2>&1 1>/dev/null)" = 'Error: Identity provider group "foo" already exists' ]
+  lxc auth identity-provider-group delete foo
+  lxc auth identity-provider-group delete bar
+
+  lxc auth identity create tls/foo
+  [ "$(! "${_LXC}" auth identity create tls/foo 2>&1 1>/dev/null)" = 'Error: An identity with name "foo" already exists' ]
+  lxc auth identity delete tls/foo
+
+  lxc project create foo
+  [ "$(! "${_LXC}" project create foo 2>&1 1>/dev/null)" = 'Error: Project "foo" already exists' ]
+  lxc project create bar
+  [ "$(! "${_LXC}" project rename bar foo 2>&1 1>/dev/null)" = 'Error: A project named "foo" already exists' ]
+  lxc project delete foo
+  lxc project delete bar
+
+  [ "$(! "${_LXC}" image alias create testimage "${test_image_fingerprint}" 2>&1 1>/dev/null)" = 'Error: Alias "testimage" already exists' ]
+
+  lxc init foo --empty
+  [ "$(! "${_LXC}" init foo --empty 2>&1 1>/dev/null)" = 'Error: Failed creating instance record: Instance "foo" already exists' ]
+  lxc init bar --empty
+  [ "$(! "${_LXC}" rename bar foo 2>&1 1>/dev/null)" = 'Error: Name "foo" already in use' ]
+  lxc delete bar
+
+  lxc snapshot foo snap0
+  [ "$(! "${_LXC}" snapshot foo snap0 2>&1 1>/dev/null)" = 'Error: Failed creating instance snapshot record "snap0": Snapshot "foo/snap0" already exists' ]
+  lxc snapshot foo snap1
+  [ "$(! "${_LXC}" rename foo/snap1 foo/snap0 2>&1 1>/dev/null)" = 'Error: Name "foo/snap0" already in use' ]
+  lxc delete foo/snap0
+  lxc delete foo/snap1
+  lxc delete foo
+
+  lxc network create foo
+  [ "$(! "${_LXC}" network create foo 2>&1 1>/dev/null)" = 'Error: The network already exists' ]
+  lxc network create bar ipv4.address=none ipv6.address=none
+  [ "$(! "${_LXC}" network rename bar foo 2>&1 1>/dev/null)" = 'Error: Network "foo" already exists' ]
+  lxc network delete bar
+
+  lxc network acl create foo
+  [ "$(! "${_LXC}" network acl create foo 2>&1 1>/dev/null)" = 'Error: The network ACL already exists' ]
+  lxc network acl create bar
+  [ "$(! "${_LXC}" network acl rename bar foo 2>&1 1>/dev/null)" = 'Error: An ACL by that name exists already' ]
+  lxc network acl delete foo
+  lxc network acl delete bar
+
+  lxc network zone create foo
+  [ "$(! "${_LXC}" network zone create foo 2>&1 1>/dev/null)" = 'Error: The network zone already exists' ]
+  lxc network zone delete foo
+
+  lxc network forward create foo 10.1.1.1
+  [ "$(! "${_LXC}" network forward create foo 10.1.1.1 2>&1 1>/dev/null)" = 'Error: Failed creating forward: A forward for that listen address already exists' ]
+  lxc network forward delete foo 10.1.1.1
+
+  lxc network forward create foo 2001:db8::1
+  [ "$(! "${_LXC}" network forward create foo 2001:db8::1 2>&1 1>/dev/null)" = 'Error: Failed creating forward: A forward for that listen address already exists' ]
+  lxc network forward delete foo 2001:db8::1
+
+  lxc network delete foo
+
+  if ovn_enabled; then
+    setup_ovn
+    uplink_network="uplink$$"
+    ip link add dummy0 type dummy
+    lxc network create "${uplink_network}" --type=physical parent=dummy0
+    lxc network set "${uplink_network}" ipv4.ovn.ranges=192.0.2.100-192.0.2.254
+    lxc network set "${uplink_network}" ipv6.ovn.ranges=2001:db8:1:2::100-2001:db8:1:2::254
+    lxc network set "${uplink_network}" ipv4.routes=192.0.2.0/24
+    lxc network set "${uplink_network}" ipv6.routes=2001:db8:1:2::/64
+    lxc network create foo-ovn --type ovn network="${uplink_network}"
+
+    lxc network load-balancer create foo-ovn 192.0.2.10
+    [ "$(! "${_LXC}" network load-balancer create foo-ovn 192.0.2.10 2>&1 1>/dev/null)" = 'Error: Failed creating load balancer: Listen address "192.0.2.10" overlaps with another network or NIC' ]
+    lxc network load-balancer delete foo-ovn 192.0.2.10
+
+    lxc network create foo-ovn2 --type ovn network="${uplink_network}"
+    lxc network peer create foo-ovn foo foo-ovn2
+    [ "$(! "${_LXC}" network peer create foo-ovn foo foo-ovn2 2>&1 1>/dev/null)" = 'Error: Failed creating peer: A peer for that name already exists' ]
+    lxc network peer delete foo-ovn foo
+
+    lxc network delete foo-ovn
+    lxc network delete foo-ovn2
+    lxc network delete "${uplink_network}"
+    ip link delete dummy0
+    unset_ovn_configuration
+  fi
+
+  lxc profile create foo
+  [ "$(! "${_LXC}" profile create foo 2>&1 1>/dev/null)" = 'Error: Error inserting "foo" into database: The profile already exists' ]
+  lxc profile create bar
+  [ "$(! "${_LXC}" profile rename bar foo 2>&1 1>/dev/null)" = 'Error: Name "foo" already in use' ]
+  lxc profile delete foo
+  lxc profile delete bar
+
+  lxc storage create foo dir
+  [ "$(! "${_LXC}" storage create foo dir 2>&1 1>/dev/null)" = 'Error: Storage pool "foo" already exists' ]
+
+  lxc storage bucket create foo foo
+  [ "$(! "${_LXC}" storage bucket create foo foo 2>&1 1>/dev/null)" = 'Error: Failed creating storage bucket: Failed inserting storage bucket "foo" for project "default" in pool "foo" into database: A bucket for that name already exists' ]
+  lxc storage bucket delete foo foo
+
+  lxc storage volume create foo foo
+  [ "$(! "${_LXC}" storage volume create foo foo 2>&1 1>/dev/null)" = 'Error: Volume by that name already exists' ]
+  lxc storage volume create foo bar
+  [ "$(! "${_LXC}" storage volume rename foo bar foo 2>&1 1>/dev/null)" = 'Error: Volume by that name already exists' ]
+  lxc storage volume delete foo bar
+
+  lxc storage volume snapshot foo foo snap0
+  [ "$(! "${_LXC}" storage volume snapshot foo foo snap0 2>&1 1>/dev/null)" = 'Error: Snapshot "snap0" already in use' ]
+  lxc storage volume snapshot foo foo snap1
+  [ "$(! "${_LXC}" storage volume rename foo foo/snap1 foo/snap0 2>&1 1>/dev/null)" = 'Error: Storage volume snapshot "snap0" already exists for volume "foo"' ]
+  lxc storage volume delete foo foo/snap0
+  lxc storage volume delete foo foo/snap1
+  lxc storage volume delete foo foo
+  lxc storage delete foo
 }

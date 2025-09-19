@@ -11,12 +11,7 @@ test_migration() {
 
   LXD2_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   spawn_lxd "${LXD2_DIR}" true
-  LXD2_ADDR=$(cat "${LXD2_DIR}/lxd.addr")
-
-  if command -v criu >/dev/null; then
-    # workaround for kernel/criu
-    umount /sys/kernel/debug >/dev/null 2>&1 || true
-  fi
+  LXD2_ADDR=$(< "${LXD2_DIR}/lxd.addr")
 
   token="$(lxc config trust add --name foo -q)"
   # shellcheck disable=2153
@@ -79,8 +74,7 @@ test_migration() {
   # Test config overrides for migration of instance with snapshots
   lxc_remote network create l1:foonet ipv4.address=10.100.10.1/24
   lxc_remote network create l2:foonet2 ipv4.address=10.100.100.1/24
-  ensure_import_testimage
-  lxc_remote init testimage l1:u1
+  lxc_remote init --empty l1:u1
   lxc_remote config device add l1:u1 eth1 nic name=eth1 network=foonet ipv4.address=10.100.10.10
   lxc_remote snapshot l1:u1 snap
 
@@ -205,13 +199,13 @@ migration() {
 
   # Local container only copy.
   lxc copy cccp udssr --instance-only
-  [ "$(lxc info udssr | grep -c snap)" -eq 0 ]
+  [ "$(lxc list -f csv -c S udssr)" = "0" ]
   [ "$(lxc file pull udssr/blah -)" = "after" ]
   lxc delete udssr
 
   # Local container with snapshots copy.
   lxc copy cccp udssr
-  [ "$(lxc info udssr | grep -c snap)" -eq 2 ]
+  [ "$(lxc list -f csv -c S udssr)" = "2" ]
   [ "$(lxc file pull udssr/blah -)" = "after" ]
   lxc storage volume show "${pool}" container/udssr
   [ "$(lxc storage volume get "${pool}" container/udssr user.foo)" = "postsnap1" ]
@@ -221,13 +215,13 @@ migration() {
 
   # Remote container only copy.
   lxc_remote copy l1:cccp l2:udssr --instance-only
-  [ "$(lxc_remote info l2:udssr | grep -c snap)" -eq 0 ]
+  [ "$(lxc_remote list -f csv -c S l2:udssr)" = "0" ]
   [ "$(lxc_remote file pull l2:udssr/blah -)" = "after" ]
   lxc_remote delete l2:udssr
 
   # Remote container with snapshots copy.
   lxc_remote copy l1:cccp l2:udssr
-  [ "$(lxc_remote info l2:udssr | grep -c snap)" -eq 2 ]
+  [ "$(lxc_remote list -f csv -c S l2:udssr)" = "2" ]
   [ "$(lxc_remote file pull l2:udssr/blah -)" = "after" ]
   lxc_remote storage volume show l2:"${remote_pool}" container/udssr
   [ "$(lxc_remote storage volume get l2:"${remote_pool}" container/udssr user.foo)" = "postsnap1" ]
@@ -238,7 +232,7 @@ migration() {
   # Remote container only move.
   lxc_remote move l1:cccp l2:udssr --instance-only --mode=relay
   ! lxc_remote info l1:cccp || false
-  [ "$(lxc_remote info l2:udssr | grep -c snap)" -eq 0 ]
+  [ "$(lxc_remote list -f csv -c S l2:udssr)" = "0" ]
   lxc_remote delete l2:udssr
 
   lxc_remote init testimage l1:cccp
@@ -248,7 +242,7 @@ migration() {
   # Remote container with snapshots move.
   lxc_remote move l1:cccp l2:udssr --mode=push
   ! lxc_remote info l1:cccp || false
-  [ "$(lxc_remote info l2:udssr | grep -c snap)" -eq 2 ]
+  [ "$(lxc_remote list -f csv -c S l2:udssr)" = "2" ]
   lxc_remote delete l2:udssr
 
   # Test container only copies
@@ -259,7 +253,7 @@ migration() {
   # Local container with snapshots move.
   lxc move cccp udssr --mode=pull
   ! lxc info cccp || false
-  [ "$(lxc info udssr | grep -c snap)" -eq 2 ]
+  [ "$(lxc list -f csv -c S udssr)" = "2" ]
   lxc delete udssr
 
   if [ "$lxd_backend" = "zfs" ]; then
@@ -271,12 +265,12 @@ migration() {
 
     # Test container only copies when zfs.clone_copy is set to false.
     lxc copy cccp udssr --instance-only
-    [ "$(lxc info udssr | grep -c snap)" -eq 0 ]
+    [ "$(lxc list -f csv -c S udssr)" = "0" ]
     lxc delete udssr
 
     # Test container with snapshots copy when zfs.clone_copy is set to false.
     lxc copy cccp udssr
-    [ "$(lxc info udssr | grep -c snap)" -eq 2 ]
+    [ "$(lxc list -f csv -c S udssr)" = "2" ]
     lxc delete cccp
     lxc delete udssr
 
@@ -306,15 +300,13 @@ migration() {
   # Refresh the container and validate the contents
   lxc_remote copy l1:c1 l2:c2 --refresh
   lxc_remote start l2:c2
-  lxc_remote file pull l2:c2/root/testfile1 .
-  [ "$(cat testfile1)" = "test" ]
-  rm testfile1
+  [ "$(lxc_remote file pull l2:c2/root/testfile1 -)" = "test" ]
   lxc_remote stop -f l2:c2
 
   # Change the files modification time by adding one nanosecond.
   # Perform the change on the test runner since the busybox instances `touch` doesn't support setting nanoseconds.
   lxc_remote start l1:c1
-  c1_pid="$(lxc_remote query l1:/1.0/instances/c1?recursion=1 | jq -r .state.pid)"
+  c1_pid="$(lxc_remote list -f csv -c p l1:c1)"
   mtime_old="$(stat -c %y "/proc/${c1_pid}/root/root/testfile1")"
   mtime_old_ns="$(date -d "$mtime_old" +%N | sed 's/^0*//')"
 
@@ -328,7 +320,7 @@ migration() {
 
   # Change the modification time.
   lxc_remote start l1:c1
-  c1_pid="$(lxc_remote query l1:/1.0/instances/c1?recursion=1 | jq -r .state.pid)"
+  c1_pid="$(lxc_remote list -f csv -c p l1:c1)"
   touch -m -d "$mtime_new" "/proc/${c1_pid}/root/root/testfile1"
   lxc_remote stop -f l1:c1
 
@@ -336,16 +328,16 @@ migration() {
   # Check if the file got refreshed to a different remote.
   lxc_remote copy l1:c1 l2:c2 --refresh
   lxc_remote start l1:c1 l2:c2
-  c1_pid="$(lxc_remote query l1:/1.0/instances/c1?recursion=1 | jq -r .state.pid)"
-  c2_pid="$(lxc_remote query l2:/1.0/instances/c2?recursion=1 | jq -r .state.pid)"
+  c1_pid="$(lxc_remote list -f csv -c p l1:c1)"
+  c2_pid="$(lxc_remote list -f csv -c p l2:c2)"
   [ "$(stat "/proc/${c1_pid}/root/root/testfile1" -c %y)" = "$(stat "/proc/${c2_pid}/root/root/testfile1" -c %y)" ]
   lxc_remote stop -f l1:c1 l2:c2
 
   # Check if the file got refreshed locally.
   lxc_remote copy l1:c1 l1:c2 --refresh
   lxc_remote start l1:c1 l1:c2
-  c1_pid="$(lxc_remote query l1:/1.0/instances/c1?recursion=1 | jq -r .state.pid)"
-  c2_pid="$(lxc_remote query l1:/1.0/instances/c2?recursion=1 | jq -r .state.pid)"
+  c1_pid="$(lxc_remote list -f csv -c p l1:c1)"
+  c2_pid="$(lxc_remote list -f csv -c p l1:c2)"
   [ "$(stat "/proc/${c1_pid}/root/root/testfile1" -c %y)" = "$(stat "/proc/${c2_pid}/root/root/testfile1" -c %y)" ]
   lxc_remote rm -f l1:c2
   lxc_remote stop -f l1:c1
@@ -539,11 +531,50 @@ migration() {
   echo "==> Check that moving a container with attached local volume succeeds, if the destination has a volume with the same name."
   lxc_remote move l2:c1 l1:c2
 
-  echo "==> Clean up the containers and storage."
+  echo "==> Clean up the containers and local volumes."
   lxc_remote delete -f l1:c1
   lxc_remote delete -f l1:c2
   lxc_remote storage volume delete l1:dir vol1
   lxc_remote storage volume delete l2:dir vol1
+
+  # Test VM Migration.
+  if [ "${LXD_VM_TESTS:-0}" = "0" ]; then
+    echo "==> SKIP: VM tests are disabled"
+  elif [ "${LXD_TMPFS:-0}" = "1" ] && ! runsMinimumKernel 6.6; then
+    echo "==> SKIP: QEMU requires direct-io support which requires a kernel >= 6.6 for tmpfs support (LXD_TMPFS=${LXD_TMPFS})"
+  else
+    echo "==> Test VM migration with attached local volumes."
+
+    echo "==> Create a volume to attach to VM."
+    lxc_remote storage volume create l1:dir vol1 size=4MiB
+
+    echo "==> Create a VM to test migration with attached local volume."
+    lxc_remote init --vm --empty l1:v1 -c limits.memory=128MiB -d "${SMALL_ROOT_DISK}"
+    lxc_remote storage volume attach l1:dir vol1 v1 /files
+
+    echo "==> Check that copying a VM with attached local volume fails, if the destination does not have a volume with the same name."
+    ! lxc_remote copy l1:v1 l2: || false
+
+    echo "==> Check that moving a VM with attached local volume fails, if the destination does not have a volume with the same name."
+    ! lxc_remote move l1:v1 l2: || false
+
+    echo "==> Copy the volume."
+    lxc_remote storage volume copy l1:dir/vol1 l2:dir/vol1
+
+    echo "==> Check that copying a VM with attached local volume succeeds, if the destination has a volume with the same name."
+    lxc_remote copy l1:v1 l2:
+
+    echo "==> Check that moving a VM with attached local volume succeeds, if the destination has a volume with the same name."
+    lxc_remote move l2:v1 l1:v2
+
+    echo "==> Clean up the VMs and local volumes."
+    lxc_remote delete -f l1:v1
+    lxc_remote delete -f l1:v2
+    lxc_remote storage volume delete l1:dir vol1
+    lxc_remote storage volume delete l2:dir vol1
+  fi
+
+  echo "==> Clean up the storage pool."
   lxc_remote storage delete l1:dir
   lxc_remote storage delete l2:dir
 
@@ -624,7 +655,7 @@ migration() {
   lxc_remote restore l2:c1 snap0
   lxc_remote start l2:c1
   lxc_remote file pull l2:c1/tmp/foo .
-  ! lxc_remote file pull l2:c1/tmp/bar . ||  false
+  ! lxc_remote file pull l2:c1/tmp/bar . || false
   lxc_remote stop l2:c1 -f
 
   rm foo bar
@@ -697,45 +728,31 @@ migration() {
   lxc storage volume delete l2:"${remote_pool}" iso2
   rm -f foo.iso
 
-  if ! command -v criu >/dev/null 2>&1; then
-    echo "==> SKIP: live migration with CRIU (missing binary)"
-    return
-  fi
-
-  echo "==> CRIU: starting testing live-migration"
+  echo "==> Test container live migration (not supported)"
   lxc_remote launch testimage l1:migratee -c raw.lxc=lxc.console.path=none
 
-  # Wait for the container to be done booting
-  sleep 1
+  # Stateful stop is not supported for containers.
+  ! lxc_remote stop --stateful l1:migratee || false
 
-  # Test stateful stop
-  lxc_remote stop --stateful l1:migratee
-  lxc_remote start l1:migratee
+  # Stateful snapshots are not supported for containers.
+  ! lxc_remote snapshot --stateful l1:migratee || false
 
-  # Test stateful snapshots
-  # There is apparently a bug in CRIU that prevents checkpointing an instance that has been started from a
-  # checkpoint. So stop instance first before taking stateful snapshot.
-  lxc_remote stop -f l1:migratee
-  lxc_remote start l1:migratee
-  lxc_remote snapshot --stateful l1:migratee
-  lxc_remote restore l1:migratee snap0
+  # Take stateless snapshot.
+  lxc_remote snapshot l1:migratee
 
-  # Test live migration of container
-  # There is apparently a bug in CRIU that prevents checkpointing an instance that has been started from a
-  # checkpoint. So stop instance first before taking stateful snapshot.
-  lxc_remote stop -f l1:migratee
-  lxc_remote start l1:migratee
-  lxc_remote move l1:migratee l2:migratee
+  # Check container isn't frozen.
+  LXC_LOCAL='' lxc_remote exec l1:migratee -- ls
 
-  # Test copy of stateful snapshot
-  lxc_remote copy l2:migratee/snap0 l1:migratee
-  ! lxc_remote copy l2:migratee/snap0 l1:migratee-new-name || false
+  # Live migration is not supported for containers.
+  ! lxc_remote move l1:migratee l2:migratee || false
+
+  # Test stateless move of running container with snapshot.
+  lxc_remote move --stateless l1:migratee l2:migratee
 
   # Test stateless copies
   lxc_remote copy --stateless l2:migratee/snap0 l1:migratee-new-name
 
   # Cleanup
-  lxc_remote delete --force l1:migratee
   lxc_remote delete --force l2:migratee
   lxc_remote delete --force l1:migratee-new-name
 }

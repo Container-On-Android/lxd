@@ -108,7 +108,7 @@ type Operation struct {
 	entityType  entity.Type
 	entitlement auth.Entitlement
 	dbOpType    operationtype.Type
-	requestor   *api.EventLifecycleRequestor
+	requestor   *request.Requestor
 	logger      logger.Logger
 
 	// Those functions are called at various points in the Operation lifecycle
@@ -186,7 +186,8 @@ func OperationCreate(ctx context.Context, s *state.State, projectName string, op
 	}
 
 	// Set requestor if the request context is provided.
-	if request.IsRequestContext(ctx) {
+	_, err = request.GetRequestor(ctx)
+	if err == nil {
 		op.SetRequestor(ctx)
 	}
 
@@ -216,7 +217,26 @@ func (op *Operation) SetEventServer(events *events.Server) {
 
 // SetRequestor sets a requestor for this operation from an http.Request.
 func (op *Operation) SetRequestor(ctx context.Context) {
-	op.requestor = request.CreateRequestor(ctx)
+	op.requestor, _ = request.GetRequestor(ctx)
+}
+
+// CheckRequestor checks that the requestor of a given HTTP request is equal to the requestor of the operation.
+func (op *Operation) CheckRequestor(r *http.Request) error {
+	opRequestor := op.Requestor()
+	if opRequestor == nil {
+		return errors.New("Operation does not contain a requestor")
+	}
+
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return fmt.Errorf("Failed to verify operation requestor: %w", err)
+	}
+
+	if !opRequestor.CallerIsEqual(requestor) {
+		return api.StatusErrorf(http.StatusForbidden, "Operation requestor mismatch")
+	}
+
+	return nil
 }
 
 // SetOnDone sets the operation onDone function that is called after the operation completes.
@@ -225,8 +245,17 @@ func (op *Operation) SetOnDone(f func(*Operation)) {
 }
 
 // Requestor returns the initial requestor for this operation.
-func (op *Operation) Requestor() *api.EventLifecycleRequestor {
+func (op *Operation) Requestor() *request.Requestor {
 	return op.requestor
+}
+
+// EventLifecycleRequestor returns the [api.EventLifecycleRequestor] for the operation.
+func (op *Operation) EventLifecycleRequestor() *api.EventLifecycleRequestor {
+	if op.requestor == nil {
+		return &api.EventLifecycleRequestor{}
+	}
+
+	return op.requestor.EventLifecycleRequestor()
 }
 
 func (op *Operation) done() {
@@ -255,7 +284,7 @@ func (op *Operation) done() {
 
 		select {
 		case <-shutdownCtx.Done():
-			return // Expect all operation records to be removed by waitForOperations in one query.
+			return // Expect all operation records to be removed by daemon.Stop in one query.
 		case <-time.After(time.Second * 5): // Wait 5s before removing from internal map and database.
 		}
 
@@ -510,6 +539,11 @@ func (op *Operation) Render() (string, *api.Operation, error) {
 		Resources:   renderedResources,
 		Metadata:    op.metadata,
 		MayCancel:   op.mayCancel(),
+	}
+
+	requestor := op.Requestor()
+	if requestor != nil {
+		retOp.Requestor = requestor.OperationRequestor()
 	}
 
 	if op.state != nil {

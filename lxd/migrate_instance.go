@@ -5,15 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
-	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/canonical/lxd/lxd/instance"
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/instance/operationlock"
-	"github.com/canonical/lxd/lxd/migration"
 	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/state"
 	"github.com/canonical/lxd/shared"
@@ -41,10 +40,7 @@ func newMigrationSource(inst instance.Instance, stateful bool, instanceOnly bool
 	secretNames := []string{api.SecretNameControl, api.SecretNameFilesystem}
 	if stateful && inst.IsRunning() {
 		if inst.Type() == instancetype.Container {
-			_, err := exec.LookPath("criu")
-			if err != nil {
-				return nil, migration.ErrNoLiveMigrationSource
-			}
+			return nil, api.StatusErrorf(http.StatusBadRequest, "Live migration is not supported for containers")
 		}
 
 		ret.live = true
@@ -156,14 +152,6 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 		return fmt.Errorf("Failed migration on source: %w", err)
 	}
 
-	if !shared.IsSnapshot(s.instance.Name()) {
-		err = s.instance.PostMigrateSend()
-		if err != nil {
-			l.Error("Failed post-migration steps on source", logger.Ctx{"err": err})
-			return fmt.Errorf("Failed post-migration steps on source: %w", err)
-		}
-	}
-
 	return nil
 }
 
@@ -183,10 +171,7 @@ func newMigrationSink(args *migrationSinkArgs) (*migrationSink, error) {
 	secretNames := []string{api.SecretNameControl, api.SecretNameFilesystem}
 	if sink.live {
 		if sink.instance.Type() == instancetype.Container {
-			_, err := exec.LookPath("criu")
-			if err != nil {
-				return nil, migration.ErrNoLiveMigrationTarget
-			}
+			return nil, api.StatusErrorf(http.StatusBadRequest, "Live migration is not supported for containers")
 		}
 
 		secretNames = append(secretNames, api.SecretNameState)

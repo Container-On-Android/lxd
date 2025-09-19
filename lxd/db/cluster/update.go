@@ -114,6 +114,43 @@ var updates = map[int]schema.Update{
 	71: updateFromV70,
 	72: updateFromV71,
 	73: updateFromV72,
+	74: updateFromV73,
+	75: updateFromV74,
+	76: updateFromV75,
+}
+
+func updateFromV75(ctx context.Context, tx *sql.Tx) error {
+	entityTypeCode := strconv.FormatInt(entityTypeCodeIdentity, 10)
+	secretTypeCode := strconv.FormatInt(secretTypeCodeBearerSigningKey, 10)
+	_, err := tx.ExecContext(ctx, `
+CREATE UNIQUE INDEX secrets_bearer_identity_signing_key_unique ON secrets (entity_type, entity_id, type)
+	WHERE entity_type = `+entityTypeCode+`
+	AND type = `+secretTypeCode+`
+`)
+	return err
+}
+
+func updateFromV74(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `
+CREATE INDEX identity_name_auth_method ON identities (auth_method, name);
+`)
+	return err
+}
+
+func updateFromV73(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `
+CREATE TABLE secrets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    entity_type INTEGER NOT NULL,
+    entity_id INTEGER NOT NULL,
+    type INTEGER NOT NULL,
+    value TEXT NOT NULL,
+    creation_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX secrets_entity_type_entity_id_type ON secrets (entity_type, entity_id, type);
+`)
+	return err
 }
 
 func updateFromV72(ctx context.Context, tx *sql.Tx) error {

@@ -69,6 +69,95 @@ EOF
   shutdown_lxd "${LXD_IMPORT_DIR}"
 }
 
+test_storage_volume_recover_by_container() {
+  LXD_IMPORT_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  spawn_lxd "${LXD_IMPORT_DIR}" true
+
+  poolName=$(lxc profile device get default root pool)
+  poolDriver=$(lxc storage show "${poolName}" | awk '/^driver:/ {print $2}')
+
+  # Create another storage pool.
+  poolName2="${poolName}-2"
+  lxc storage create "${poolName2}" "${poolDriver}"
+
+  # Create container.
+  ensure_import_testimage
+  lxc init testimage c1 -d "${SMALL_ROOT_DISK}"
+
+  # Create a custom volume and attach to the instance.
+  lxc storage volume create "${poolName}" vol1 size=32MiB
+  lxc storage volume snapshot "${poolName}" vol1
+  lxc storage volume attach "${poolName}" vol1 c1 /mnt
+
+  # Create a custom volume in a different pool and attach to the instance.
+  lxc storage volume create "${poolName2}" vol2 size=32MiB
+  lxc storage volume snapshot "${poolName2}" vol2
+  lxc storage volume attach "${poolName2}" vol2 c1 /mnt2
+
+  # Get the volume's UUIDs before deleting it's database entries.
+  vol1_uuid="$(lxc storage volume get "${poolName}" vol1 volatile.uuid)"
+  vol2_uuid="$(lxc storage volume get "${poolName2}" vol2 volatile.uuid)"
+
+  # Delete database entries of the created custom volumes.
+  lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM storage_volumes WHERE name='vol1'"
+  lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM storage_volumes WHERE name='vol2'"
+
+  # Ensure the custom volumes are no longer listed.
+  ! lxc storage volume show "${poolName}" vol1 || false
+  ! lxc storage volume show "${poolName2}" vol2 || false
+
+  # Recover custom volumes.
+  cat <<EOF | lxd recover
+no
+yes
+yes
+EOF
+
+  # Ensure custom storage volumes have been recovered.
+  lxc storage volume show "${poolName}" vol1 | grep -xF 'content_type: filesystem'
+  lxc storage volume show "${poolName2}" vol2 | grep -xF 'content_type: filesystem'
+
+  # Ensure the custom volumes still have the same UUIDs.
+  # This validates that the custom storage volumes were recovered from the instance's backup config.
+  [ "${vol1_uuid}" = "$(lxc storage volume get "${poolName}" vol1 volatile.uuid)" ]
+  [ "${vol2_uuid}" = "$(lxc storage volume get "${poolName2}" vol2 volatile.uuid)" ]
+
+  # Detach the custom volumes from the instance.
+  lxc storage volume detach "${poolName}" vol1 c1
+  lxc storage volume detach "${poolName2}" vol2 c1
+
+  # Delete database entries of the created custom volumes.
+  lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM storage_volumes WHERE name='vol1'"
+  lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM storage_volumes WHERE name='vol2'"
+
+  # Ensure the custom volumes are no longer listed.
+  ! lxc storage volume show "${poolName}" vol1 || false
+  ! lxc storage volume show "${poolName2}" vol2 || false
+
+  # Recover custom volumes.
+  cat <<EOF | lxd recover
+no
+yes
+yes
+EOF
+
+  # Ensure custom storage volumes have been recovered.
+  lxc storage volume show "${poolName}" vol1 | grep -xF 'content_type: filesystem'
+  lxc storage volume show "${poolName2}" vol2 | grep -xF 'content_type: filesystem'
+
+  # Check the custom volumes got different UUIDs.
+  # This validates that the custom storage volumes were recovered by name which looses all of their configuration.
+  [ "${vol1_uuid}" != "$(lxc storage volume get "${poolName}" vol1 volatile.uuid)" ]
+  [ "${vol2_uuid}" != "$(lxc storage volume get "${poolName2}" vol2 volatile.uuid)" ]
+
+  # Cleanup
+  lxc storage volume delete "${poolName}" vol1
+  lxc storage volume delete "${poolName2}" vol2
+  lxc delete -f c1
+  lxc storage delete "${poolName2}"
+  shutdown_lxd "${LXD_IMPORT_DIR}"
+}
+
 test_container_recover() {
   LXD_IMPORT_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   spawn_lxd "${LXD_IMPORT_DIR}" true
@@ -377,7 +466,6 @@ _backup_import_with_project() {
   fi
 
   ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   lxc launch testimage c1 -d "${SMALL_ROOT_DISK}"
   lxc launch testimage c2 -d "${SMALL_ROOT_DISK}"
@@ -509,17 +597,17 @@ _backup_import_with_project() {
   lxc storage create pool_2 dir
 
   # Export created container
-  lxc init testimage c3 -d "${SMALL_ROOT_DISK}" -s pool_1
+  lxc init --empty c3 -d "${SMALL_ROOT_DISK}" -s pool_1
   lxc export c3 "${LXD_DIR}/c3.tar.gz"
 
   # Remove container and storage pool
-  lxc delete -f c3
+  lxc delete c3
   lxc storage delete pool_1
 
   # This should succeed as it will fall back on the default pool
   lxc import "${LXD_DIR}/c3.tar.gz"
 
-  lxc delete -f c3
+  lxc delete c3
 
   # Remove root device
   lxc profile device remove default root
@@ -533,7 +621,7 @@ _backup_import_with_project() {
   # Specify pool explicitly
   lxc import "${LXD_DIR}/c3.tar.gz" -s pool_2
 
-  lxc delete -f c3
+  lxc delete c3
 
   # Reset default storage pool
   lxc profile device add default root disk path=/ pool="${default_pool}"
@@ -574,7 +662,6 @@ _backup_export_with_project() {
   fi
 
   ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   lxc launch testimage c1 -d "${SMALL_ROOT_DISK}"
   lxc snapshot c1
@@ -647,9 +734,6 @@ _backup_export_with_project() {
 }
 
 test_backup_rename() {
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
-
   OUTPUT="$(! lxc query -X POST /1.0/containers/c1/backups/backupmissing -d '{\"name\": \"backupnewname\"}' --wait 2>&1 || false)"
   if ! echo "${OUTPUT}" | grep -F "Error: Instance backup not found" ; then
     echo "invalid rename response for missing container"
@@ -719,12 +803,11 @@ _backup_volume_export_with_project() {
 
     # Add a root device to the default profile of the project.
     lxc profile device add default root disk path="/" pool="${pool}"
+  else
+    ensure_import_testimage
   fi
 
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
-
-  mkdir "${LXD_DIR}/optimized" "${LXD_DIR}/non-optimized"
+  mkdir "${LXD_DIR}/optimized" "${LXD_DIR}/non-optimized" "${LXD_DIR}/optimized-none" "${LXD_DIR}/optimized-squashfs" "${LXD_DIR}/non-optimized-none" "${LXD_DIR}/non-optimized-squashfs"
   lxd_backend=$(storage_backend "$LXD_DIR")
 
   # Create test container.
@@ -754,74 +837,91 @@ _backup_volume_export_with_project() {
   lxc storage volume set "${custom_vol_pool}" testvol user.foo=post-test-snap1
 
   if storage_backend_optimized_backup "$lxd_backend"; then
-    # Create optimized backup without snapshots.
+    # Create optimized backups without snapshots.
     lxc storage volume export "${custom_vol_pool}" testvol "${LXD_DIR}/testvol-optimized.tar.gz" --volume-only --optimized-storage
+    lxc storage volume export "${custom_vol_pool}" testvol "${LXD_DIR}/testvol-optimized.tar" --volume-only --optimized-storage --compression none
+    lxc storage volume export "${custom_vol_pool}" testvol "${LXD_DIR}/testvol-optimized.squashfs" --volume-only --optimized-storage --compression squashfs
 
-    [ -f "${LXD_DIR}/testvol-optimized.tar.gz" ]
-
-    # Extract backup tarball.
+    # Extract backups.
     tar --warning=no-timestamp -xzf "${LXD_DIR}/testvol-optimized.tar.gz" -C "${LXD_DIR}/optimized"
+    tar --warning=no-timestamp -xf "${LXD_DIR}/testvol-optimized.tar" -C "${LXD_DIR}/optimized-none"
+    unsquashfs -f -d "${LXD_DIR}/optimized-squashfs" "${LXD_DIR}/testvol-optimized.squashfs"
 
-    ls -l "${LXD_DIR}/optimized/backup/"
-    [ -f "${LXD_DIR}/optimized/backup/index.yaml" ]
-    [ -f "${LXD_DIR}/optimized/backup/volume.bin" ]
-    [ ! -d "${LXD_DIR}/optimized/backup/volume-snapshots" ]
+    # Check extracted content.
+    for d in optimized optimized-none optimized-squashfs; do
+      ls -l "${LXD_DIR}/${d}/backup/"
+      [ -f "${LXD_DIR}/${d}/backup/index.yaml" ]
+      [ -f "${LXD_DIR}/${d}/backup/volume.bin" ]
+      [ ! -d "${LXD_DIR}/${d}/backup/volume-snapshots" ]
+
+      ! grep -F -- '- test-snap0' "${LXD_DIR}/${d}/backup/index.yaml" || false
+    done
   fi
 
-  # Create non-optimized backup without snapshots.
+  # Create non-optimized backups without snapshots.
   lxc storage volume export "${custom_vol_pool}" testvol "${LXD_DIR}/testvol.tar.gz" --volume-only
+  lxc storage volume export "${custom_vol_pool}" testvol "${LXD_DIR}/testvol.tar" --volume-only --compression none
+  lxc storage volume export "${custom_vol_pool}" testvol "${LXD_DIR}/testvol.squashfs" --volume-only --compression squashfs
 
-  [ -f "${LXD_DIR}/testvol.tar.gz" ]
-
-  # Extract non-optimized backup tarball.
+  # Extract non-optimized backups.
   tar --warning=no-timestamp -xzf "${LXD_DIR}/testvol.tar.gz" -C "${LXD_DIR}/non-optimized"
+  tar --warning=no-timestamp -xf "${LXD_DIR}/testvol.tar" -C "${LXD_DIR}/non-optimized-none"
+  unsquashfs -f -d "${LXD_DIR}/non-optimized-squashfs" "${LXD_DIR}/testvol.squashfs"
 
-  # Check tarball content.
-  ls -l "${LXD_DIR}/non-optimized/backup/"
-  [ -f "${LXD_DIR}/non-optimized/backup/index.yaml" ]
-  [ -d "${LXD_DIR}/non-optimized/backup/volume" ]
-  [ "$(< "${LXD_DIR}/non-optimized/backup/volume/test")" = "bar" ]
-  [ ! -d "${LXD_DIR}/non-optimized/backup/volume-snapshots" ]
+  # Check extracted content.
+  for d in non-optimized non-optimized-none non-optimized-squashfs; do
+    ls -l "${LXD_DIR}/${d}/backup/"
+    [ -f "${LXD_DIR}/${d}/backup/index.yaml" ]
+    [ -d "${LXD_DIR}/${d}/backup/volume" ]
+    [ "$(< "${LXD_DIR}/${d}/backup/volume/test")" = "bar" ]
+    [ ! -d "${LXD_DIR}/${d}/backup/volume-snapshots" ]
 
-  ! grep -F -- '- test-snap0' "${LXD_DIR}/non-optimized/backup/index.yaml" || false
+    ! grep -F -- '- test-snap0' "${LXD_DIR}/${d}/backup/index.yaml" || false
+  done
 
-  rm -rf "${LXD_DIR}/non-optimized/"*
-  rm "${LXD_DIR}/testvol.tar.gz"
+  rm "${LXD_DIR}/testvol.tar.gz" "${LXD_DIR}/testvol.tar" "${LXD_DIR}/testvol.squashfs"
 
   if storage_backend_optimized_backup "$lxd_backend"; then
-    # Create optimized backup with snapshots.
+    # Create optimized backups with snapshots.
     lxc storage volume export "${custom_vol_pool}" testvol "${LXD_DIR}/testvol-optimized.tar.gz" --optimized-storage
+    lxc storage volume export "${custom_vol_pool}" testvol "${LXD_DIR}/testvol-optimized.tar" --optimized-storage --compression none
+    lxc storage volume export "${custom_vol_pool}" testvol "${LXD_DIR}/testvol-optimized.squashfs" --optimized-storage --compression squashfs
 
-    [ -f "${LXD_DIR}/testvol-optimized.tar.gz" ]
-
-    # Extract backup tarball.
+    # Extract backups.
     tar --warning=no-timestamp -xzf "${LXD_DIR}/testvol-optimized.tar.gz" -C "${LXD_DIR}/optimized"
+    tar --warning=no-timestamp -xf "${LXD_DIR}/testvol-optimized.tar" -C "${LXD_DIR}/optimized-none"
+    unsquashfs -f -d "${LXD_DIR}/optimized-squashfs" "${LXD_DIR}/testvol-optimized.squashfs"
 
-    ls -l "${LXD_DIR}/optimized/backup/"
-    [ -f "${LXD_DIR}/optimized/backup/index.yaml" ]
-    [ -f "${LXD_DIR}/optimized/backup/volume.bin" ]
-    [ -f "${LXD_DIR}/optimized/backup/volume-snapshots/test-snap0.bin" ]
+    # Check extracted content.
+    for d in optimized optimized-none optimized-squashfs; do
+      ls -l "${LXD_DIR}/${d}/backup/"
+      [ -f "${LXD_DIR}/${d}/backup/index.yaml" ]
+      [ -f "${LXD_DIR}/${d}/backup/volume.bin" ]
+      [ -f "${LXD_DIR}/${d}/backup/volume-snapshots/test-snap0.bin" ]
+    done
   fi
 
-  # Create non-optimized backup with snapshots.
+  # Create non-optimized backups with snapshots.
   lxc storage volume export "${custom_vol_pool}" testvol "${LXD_DIR}/testvol.tar.gz"
+  lxc storage volume export "${custom_vol_pool}" testvol "${LXD_DIR}/testvol.tar" --compression none
+  lxc storage volume export "${custom_vol_pool}" testvol "${LXD_DIR}/testvol.squashfs" --compression squashfs
 
-  [ -f "${LXD_DIR}/testvol.tar.gz" ]
-
-  # Extract backup tarball.
+  # Extract backups.
   tar --warning=no-timestamp -xzf "${LXD_DIR}/testvol.tar.gz" -C "${LXD_DIR}/non-optimized"
+  tar --warning=no-timestamp -xf "${LXD_DIR}/testvol.tar" -C "${LXD_DIR}/non-optimized-none"
+  unsquashfs -f -d "${LXD_DIR}/non-optimized-squashfs" "${LXD_DIR}/testvol.squashfs"
 
-  # Check tarball content.
-  ls -l "${LXD_DIR}/non-optimized/backup/"
-  [ -f "${LXD_DIR}/non-optimized/backup/index.yaml" ]
-  [ -d "${LXD_DIR}/non-optimized/backup/volume" ]
-  [ "$(< "${LXD_DIR}/non-optimized/backup/volume/test")" = "bar" ]
-  [ -d "${LXD_DIR}/non-optimized/backup/volume-snapshots/test-snap0" ]
-  [  "$(< "${LXD_DIR}/non-optimized/backup/volume-snapshots/test-snap0/test")" = "foo" ]
+  # Check extracted content.
+  for d in non-optimized non-optimized-none non-optimized-squashfs; do
+    ls -l "${LXD_DIR}/${d}/backup/"
+    [ -f "${LXD_DIR}/${d}/backup/index.yaml" ]
+    [ -d "${LXD_DIR}/${d}/backup/volume" ]
+    [ "$(< "${LXD_DIR}/${d}/backup/volume/test")" = "bar" ]
+    [ -d "${LXD_DIR}/${d}/backup/volume-snapshots/test-snap0" ]
+    [ "$(< "${LXD_DIR}/${d}/backup/volume-snapshots/test-snap0/test")" = "foo" ]
 
-  grep -F -- '- test-snap0' "${LXD_DIR}/non-optimized/backup/index.yaml"
-
-  rm -rf "${LXD_DIR}/non-optimized/"*
+    grep -F -- '- test-snap0' "${LXD_DIR}/${d}/backup/index.yaml"
+  done
 
   old_uuid="$(lxc storage volume get "${custom_vol_pool}" testvol volatile.uuid)"
   old_snap0_uuid="$(lxc storage volume get "${custom_vol_pool}" testvol/test-snap0 volatile.uuid)"
@@ -892,14 +992,13 @@ _backup_volume_export_with_project() {
   fi
 
   # Clean up.
-  rm -rf "${LXD_DIR}/non-optimized/"* "${LXD_DIR}/optimized/"*
+  rm -rf "${LXD_DIR}/non-optimized/"* "${LXD_DIR}/optimized/"* "${LXD_DIR}/non-optimized-none/"* "${LXD_DIR}/optimized-none/"* "${LXD_DIR}/non-optimized-squashfs/"* "${LXD_DIR}/optimized-squashfs/"*
   lxc storage volume detach "${custom_vol_pool}" testvol c1
   lxc storage volume detach "${custom_vol_pool}" testvol2 c1
   lxc storage volume rm "${custom_vol_pool}" testvol
   lxc storage volume rm "${custom_vol_pool}" testvol2
   lxc delete -f c1
-  rmdir "${LXD_DIR}/optimized"
-  rmdir "${LXD_DIR}/non-optimized"
+  rmdir "${LXD_DIR}/optimized" "${LXD_DIR}/non-optimized" "${LXD_DIR}/optimized-none" "${LXD_DIR}/non-optimized-none" "${LXD_DIR}/non-optimized-squashfs" "${LXD_DIR}/optimized-squashfs"
 
   if [ "${project}" != "default" ]; then
     lxc project switch default
@@ -911,8 +1010,6 @@ _backup_volume_export_with_project() {
 }
 
 test_backup_volume_rename_delete() {
-  ensure_has_localhost_remote "${LXD_ADDR}"
-
   pool="lxdtest-$(basename "${LXD_DIR}")"
 
   # Create test volume.
@@ -971,9 +1068,6 @@ test_backup_volume_rename_delete() {
 }
 
 test_backup_instance_uuid() {
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
-
   echo "==> Checking instance UUIDs during backup operation"
   lxc init --empty c1 -d "${SMALL_ROOT_DISK}"
   initialUUID=$(lxc config get c1 volatile.uuid)
@@ -1036,13 +1130,10 @@ test_backup_export_import_recover() {
 
     poolName=$(lxc profile device get default root pool)
 
-    ensure_import_testimage
-    ensure_has_localhost_remote "${LXD_ADDR}"
-
     # Create and export an instance.
-    lxc init testimage c1 -d "${SMALL_ROOT_DISK}"
+    lxc init --empty c1 -d "${SMALL_ROOT_DISK}"
     lxc export c1 "${LXD_DIR}/c1.tar.gz"
-    lxc delete -f c1
+    lxc delete c1
 
     # Import instance and remove no longer required tarball.
     lxc import "${LXD_DIR}/c1.tar.gz" c2
@@ -1060,15 +1151,12 @@ yes
 EOF
 
     # Remove recovered instance.
-    lxc delete -f c2
+    lxc delete c2
   )
 }
 
 test_backup_export_import_instance_only() {
   poolName=$(lxc profile device get default root pool)
-
-  ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   # Create an instance with snapshot.
   lxc init --empty c1 -d "${SMALL_ROOT_DISK}"
@@ -1079,7 +1167,7 @@ test_backup_export_import_instance_only() {
 
   # Export the instance and remove it.
   lxc export c1 "${LXD_DIR}/c1.tar.gz" --instance-only
-  lxc delete -f c1
+  lxc delete c1
 
   # Import the instance from tarball.
   lxc import "${LXD_DIR}/c1.tar.gz"
@@ -1088,12 +1176,11 @@ test_backup_export_import_instance_only() {
   [ "$(lxc query "/1.0/storage-pools/${poolName}/volumes/container/c1/snapshots" | jq -r 'length')" = "0" ]
 
   rm "${LXD_DIR}/c1.tar.gz"
-  lxc delete -f c1
+  lxc delete c1
 }
 
 test_backup_metadata() {
   ensure_import_testimage
-  ensure_has_localhost_remote "${LXD_ADDR}"
 
   # Fetch the least and most recent supported backup metadata version from the range.
   lowest_version=$(lxc query /1.0 | jq -r .environment.backup_metadata_version_range[0])
@@ -1105,8 +1192,69 @@ test_backup_metadata() {
   tmpDir=$(mktemp -d -p "${TEST_DIR}" metadata-XXX)
 
   # Create an instance with one snapshot.
-  lxc init --empty c1 -d "${SMALL_ROOT_DISK}"
+  lxc init testimage c1 -d "${SMALL_ROOT_DISK}"
   lxc snapshot c1
+
+  # Attach a disk from another pool with one snapshot.
+  custom_vol_pool="lxdtest-$(basename "${LXD_DIR}")-dir"
+  lxc storage create "${custom_vol_pool}" dir
+  lxc storage volume create "${custom_vol_pool}" foo
+  lxc storage volume snapshot "${custom_vol_pool}" foo
+  lxc storage volume attach "${custom_vol_pool}" foo c1 path=/mnt
+  [ "$(lxc query "/1.0/instances/c1" | jq '.expanded_devices | map(select(.type=="disk")) | length')" = "2" ]
+
+  lxc start c1
+  backup_yaml_path="${LXD_DIR}/containers/c1/backup.yaml"
+  cat "${backup_yaml_path}"
+
+  # Test the containers backup config contains the latest format.
+  [ "$(yq -r '.snapshots | length' < "${backup_yaml_path}")" = "1" ]
+  [ "$(yq -r .version < "${backup_yaml_path}")" = "${highest_version}" ]
+  [ "$(yq -r '.volumes | length' < "${backup_yaml_path}")" = "2" ]
+  [ "$(yq -r '.volumes.[0].snapshots | length' < "${backup_yaml_path}")" = "1" ]
+  [ "$(yq -r '.volumes.[1].snapshots | length' < "${backup_yaml_path}")" = "1" ]
+  [ "$(yq -r '.pools | length' < "${backup_yaml_path}")" = "2" ]
+
+  # Test attaching the same vol a second time doesn't increase it's appearance in the backup config.
+  lxc storage volume attach "${custom_vol_pool}" foo c1 foo2 /mnt2
+  [ "$(lxc query "/1.0/instances/c1" | jq '.expanded_devices | map(select(.type=="disk")) | length')" = "3" ]
+  [ "$(yq -r '.volumes | length' < "${backup_yaml_path}")" = "2" ]
+  [ "$(yq -r '.volumes.[0].snapshots | length' < "${backup_yaml_path}")" = "1" ]
+  [ "$(yq -r '.volumes.[1].snapshots | length' < "${backup_yaml_path}")" = "1" ]
+  [ "$(yq -r '.pools | length' < "${backup_yaml_path}")" = "2" ]
+  lxc storage volume detach "${custom_vol_pool}" foo c1 foo2
+
+  # Test custom volume changes are reflected in the config file.
+  lxc storage volume set "${custom_vol_pool}" foo user.foo bar # test volume config update
+  [ "$(yq -r '.volumes.[] | select(.name == "foo" and .pool == "'"${custom_vol_pool}"'") | .config."user.foo"' < "${backup_yaml_path}")" = "bar" ]
+  lxc storage volume unset "${custom_vol_pool}" foo user.foo
+  [ "$(yq -r '.volumes.[] | select(.name == "foo" and .pool == "'"${custom_vol_pool}"'") | .config."user.foo"' < "${backup_yaml_path}")" = "null" ]
+  [ "$(yq -r '.volumes | length' < "${backup_yaml_path}")" = "2" ]
+  [ "$(yq -r '.pools | length' < "${backup_yaml_path}")" = "2" ]
+  lxc storage volume detach "${custom_vol_pool}" foo c1 # test detaching/attaching vol and its effects on the list of vols and pools
+  [ "$(yq -r '.volumes | length' < "${backup_yaml_path}")" = "1" ]
+  [ "$(yq -r '.pools | length' < "${backup_yaml_path}")" = "1" ]
+  lxc storage volume attach "${custom_vol_pool}" foo c1 path=/mnt
+  [ "$(yq -r '.volumes | length' < "${backup_yaml_path}")" = "2" ]
+  [ "$(yq -r '.pools | length' < "${backup_yaml_path}")" = "2" ]
+
+  # Test custom volume snapshots changes are reflected in the config file.
+  lxc storage volume snapshot "${custom_vol_pool}" foo # test snapshot creation
+  [ "$(yq -r '.volumes.[] | select(.name == "foo" and .pool == "'"${custom_vol_pool}"'") | .snapshots | length' < "${backup_yaml_path}")" = "2" ]
+  lxc storage volume rm "${custom_vol_pool}" foo/snap1
+  [ "$(yq -r '.volumes.[] | select(.name == "foo" and .pool == "'"${custom_vol_pool}"'") | .snapshots | length' < "${backup_yaml_path}")" = "1" ]
+  lxc storage volume rename "${custom_vol_pool}" foo/snap0 foo/snap00 # test snapshot rename
+  [ "$(yq -r '.volumes.[] | select(.name == "foo" and .pool == "'"${custom_vol_pool}"'") | .snapshots.[] | select(.name == "snap00") | .name' < "${backup_yaml_path}")" = "snap00" ]
+  [ "$(yq -r '.volumes.[] | select(.name == "foo" and .pool == "'"${custom_vol_pool}"'") | .snapshots.[] | select(.name == "snap0") | .name' < "${backup_yaml_path}")" = "" ]
+  lxc storage volume rename "${custom_vol_pool}" foo/snap00 foo/snap0
+  [ "$(yq -r '.volumes.[] | select(.name == "foo" and .pool == "'"${custom_vol_pool}"'") | .snapshots.[] | select(.name == "snap0") | .name' < "${backup_yaml_path}")" = "snap0" ]
+  [ "$(yq -r '.volumes.[] | select(.name == "foo" and .pool == "'"${custom_vol_pool}"'") | .snapshots.[] | select(.name == "snap00") | .name' < "${backup_yaml_path}")" = "" ]
+  lxc storage volume set "${custom_vol_pool}" foo/snap0 --property description bar # test snapshot update (only description can be updated on snaps)
+  [ "$(yq -r '.volumes.[] | select(.name == "foo" and .pool == "'"${custom_vol_pool}"'") | .snapshots.[] | select(.name == "snap0") | .description' < "${backup_yaml_path}")" = "bar" ]
+  lxc storage volume unset "${custom_vol_pool}" foo/snap0 --property description
+  [ "$(yq -r '.volumes.[] | select(.name == "foo" and .pool == "'"${custom_vol_pool}"'") | .snapshots.[] | select(.name == "snap0") | .description' < "${backup_yaml_path}")" = "" ]
+
+  lxc stop -f c1
 
   # Export the instance without setting an export version.
   # The server should implicitly pick its latest supported version.
@@ -1118,6 +1266,7 @@ test_backup_metadata() {
   [ "$(yq .config.version < "${tmpDir}/backup/index.yaml")" = "${highest_version}" ]
   [ "$(yq '.config.volumes | length' < "${tmpDir}/backup/index.yaml")" = "1" ]
   [ "$(yq '.config.volumes.[0].snapshots | length' < "${tmpDir}/backup/index.yaml")" = "1" ]
+  [ "$(yq '.config.pools | length' < "${tmpDir}/backup/index.yaml")" = "1" ]
 
   rm -rf "${tmpDir}/backup" "${tmpDir}/c1.tar.gz"
 
@@ -1135,7 +1284,7 @@ test_backup_metadata() {
   [ "$(yq '.config.volume_snapshots | length' < "${tmpDir}/backup/index.yaml")" = "1" ]
 
   rm -rf "${tmpDir}/backup" "${tmpDir}/c1.tar.gz"
-  lxc delete -f c1
+  lxc delete c1
 
   # Create a custom storage volume with one snapshot.
   poolName=$(lxc profile device get default root pool)
@@ -1153,6 +1302,7 @@ test_backup_metadata() {
   [ "$(yq .config.instance < "${tmpDir}/backup/index.yaml")" = "null" ]
   [ "$(yq '.config.volumes | length' < "${tmpDir}/backup/index.yaml")" = "1" ]
   [ "$(yq '.config.volumes.[0].snapshots | length' < "${tmpDir}/backup/index.yaml")" = "1" ]
+  [ "$(yq '.config.pools | length' < "${tmpDir}/backup/index.yaml")" = "1" ]
 
   rm -rf "${tmpDir}/backup" "${tmpDir}/vol1.tar.gz"
 
@@ -1170,6 +1320,8 @@ test_backup_metadata() {
 
   rm -rf "${tmpDir}/backup" "${tmpDir}/vol1.tar.gz"
   lxc storage volume delete "${poolName}" vol1
+  lxc storage volume delete "${custom_vol_pool}" foo
+  lxc storage delete "${custom_vol_pool}"
 
   rm -rf "${tmpDir}"
 }

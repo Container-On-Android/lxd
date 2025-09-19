@@ -293,7 +293,7 @@ func getAuthGroups(d *Daemon, r *http.Request) response.Response {
 		}
 
 		if len(withEntitlements) > 0 {
-			err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeAuthGroup, withEntitlements, urlToGroup)
+			err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeAuthGroup, withEntitlements, urlToGroup)
 			if err != nil {
 				return response.SmartError(err)
 			}
@@ -364,6 +364,10 @@ func createAuthGroup(d *Daemon, r *http.Request) response.Response {
 			Description: group.Description,
 		})
 		if err != nil {
+			if api.StatusErrorCheck(err, http.StatusConflict) {
+				return api.StatusErrorf(http.StatusConflict, "Authorization group %q already exists", group.Name)
+			}
+
 			return err
 		}
 
@@ -380,7 +384,7 @@ func createAuthGroup(d *Daemon, r *http.Request) response.Response {
 
 	// Send a lifecycle event for the group creation
 	lc := lifecycle.AuthGroupCreated.Event(group.Name, request.CreateRequestor(r.Context()), nil)
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+	s.Events.SendLifecycle("", lc)
 
 	return response.SyncResponseLocation(true, nil, entity.AuthGroupURL(group.Name).String())
 }
@@ -462,7 +466,7 @@ func getAuthGroup(d *Daemon, r *http.Request) response.Response {
 	}
 
 	if len(withEntitlements) > 0 {
-		err = reportEntitlements(r.Context(), s.Authorizer, s.IdentityCache, entity.TypeAuthGroup, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.AuthGroupURL(groupName): apiGroup})
+		err = reportEntitlements(r.Context(), s.Authorizer, entity.TypeAuthGroup, withEntitlements, map[*api.URL]auth.EntitlementReporter{entity.AuthGroupURL(groupName): apiGroup})
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -565,7 +569,7 @@ func updateAuthGroup(d *Daemon, r *http.Request) response.Response {
 
 	// Send a lifecycle event for the group update
 	lc := lifecycle.AuthGroupUpdated.Event(groupName, request.CreateRequestor(r.Context()), nil)
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+	s.Events.SendLifecycle("", lc)
 
 	return response.EmptySyncResponse
 }
@@ -673,7 +677,7 @@ func patchAuthGroup(d *Daemon, r *http.Request) response.Response {
 
 	// Send a lifecycle event for the group update
 	lc := lifecycle.AuthGroupUpdated.Event(groupName, request.CreateRequestor(r.Context()), nil)
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+	s.Events.SendLifecycle("", lc)
 
 	return response.EmptySyncResponse
 }
@@ -726,14 +730,13 @@ func renameAuthGroup(d *Daemon, r *http.Request) response.Response {
 
 	s := d.State()
 	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
-		err = dbCluster.RenameAuthGroup(ctx, tx.Tx(), groupName, groupPost.Name)
-		if err != nil {
-			return err
-		}
-
-		return nil
+		return dbCluster.RenameAuthGroup(ctx, tx.Tx(), groupName, groupPost.Name)
 	})
 	if err != nil {
+		if api.StatusErrorCheck(err, http.StatusConflict) {
+			return response.Conflict(fmt.Errorf("Authorization group %q already exists", groupPost.Name))
+		}
+
 		return response.SmartError(err)
 	}
 
@@ -758,7 +761,7 @@ func renameAuthGroup(d *Daemon, r *http.Request) response.Response {
 
 	// Send a lifecycle event for the group rename
 	lc := lifecycle.AuthGroupRenamed.Event(groupPost.Name, request.CreateRequestor(r.Context()), map[string]any{"old_name": groupName})
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+	s.Events.SendLifecycle("", lc)
 
 	return response.SyncResponseLocation(true, nil, entity.AuthGroupURL(groupPost.Name).String())
 }
@@ -818,7 +821,7 @@ func deleteAuthGroup(d *Daemon, r *http.Request) response.Response {
 
 	// Send a lifecycle event for the group deletion
 	lc := lifecycle.AuthGroupDeleted.Event(groupName, request.CreateRequestor(r.Context()), nil)
-	s.Events.SendLifecycle(api.ProjectDefaultName, lc)
+	s.Events.SendLifecycle("", lc)
 
 	return response.EmptySyncResponse
 }

@@ -70,6 +70,8 @@ CREATE TABLE identities_projects (
     FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
     UNIQUE (identity_id, project_id)
 );
+CREATE INDEX identity_name_auth_method ON identities (auth_method,
+    name);
 CREATE TABLE identity_provider_groups (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     name TEXT NOT NULL,
@@ -481,6 +483,21 @@ CREATE TABLE "projects_config" (
     FOREIGN KEY (project_id) REFERENCES "projects" (id) ON DELETE CASCADE,
     UNIQUE (project_id, key)
 );
+CREATE TABLE secrets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    entity_type INTEGER NOT NULL,
+    entity_id INTEGER NOT NULL,
+    type INTEGER NOT NULL,
+    value TEXT NOT NULL,
+    creation_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX secrets_bearer_identity_signing_key_unique ON secrets (entity_type, entity_id, type)
+	WHERE entity_type = 24
+	AND type = 2
+;
+CREATE INDEX secrets_entity_type_entity_id_type ON secrets (entity_type,
+    entity_id,
+    type);
 CREATE TABLE "storage_buckets" (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
 	name TEXT NOT NULL,
@@ -662,5 +679,5 @@ CREATE TABLE "warnings" (
 );
 CREATE UNIQUE INDEX warnings_unique_node_id_project_id_entity_type_code_entity_id_type_code ON warnings(IFNULL(node_id, -1), IFNULL(project_id, -1), entity_type_code, entity_id, type_code);
 
-INSERT INTO schema (version, updated_at) VALUES (73, strftime("%s"))
+INSERT INTO schema (version, updated_at) VALUES (76, strftime("%s"))
 `
